@@ -21,6 +21,12 @@ A second GEMM implementation alongside [`iron.operators.GEMM`](../../gemm),
 specialised for transformer projection shapes and ported from FastFlowLM's `mm`
 overlay.
 
+**M, K, N and the activation are runtime parameters**, so one xclbin serves
+every shape and only the instruction stream is rebuilt per shape. The
+FastFlowLM harness needs that: it registers one `mm.xclbin` per model and swaps
+instruction streams, against a budget of 16 xclbins for a whole model. See
+[Runtime parameters](#runtime-parameters).
+
 The overall dataflow is the same whole-array shape as `iron.operators.GEMM`'s —
 A broadcast along each compute row, B down each column, C joined through the
 memtile — so those are *not* what distinguishes it. What does:
@@ -39,17 +45,6 @@ control or cannot pre-pack B.
 The shipped overlay itself is available as
 [`iron.operators.flm.MMPrebuilt`](../mm_prebuilt) for comparison; `benchmark.py`
 measures the two against each other and against `iron.operators.GEMM`.
-
-**Not yet a drop-in replacement for the shipped overlay in FastFlowLM itself.**
-FLM's runtime selects matrix shape and activation per call via runtime
-parameters (RTPs) on one compiled xclbin. `M`/`K`/`N`/`epilogue`/`rounding` here
-are `GEMM(...)` constructor arguments instead -- baked into the MLIR and the
-kernel's `-D` flags at compile time (see
-[Matching the shipped overlay](#matching-the-shipped-fastflowlm-overlay)) -- so
-each shape+epilogue combination is its own compiled kernel object, not one
-kernel switchable at runtime. Using this operator inside FLM today means
-precompiling and swapping between kernels per combination; making shape and
-epilogue RTP-selectable is follow-up work.
 
 ## Architectures
 
@@ -80,6 +75,91 @@ Two consequences of the native-vs-emulated split are worth knowing:
 * **`Rounding.FLOOR` reproduces the shipped FastFlowLM overlay bit-for-bit on
   NPU2 only.** NPU1 sums the K reduction in a different order, so it matches the
   rounding *mode* but not the exact results.
+
+## Runtime parameters
+
+**Six words** in an L1 buffer per core, written by the runtime sequence and
+read by the core once its barrier opens:
+
+| word | value |
+|---|---|
+| `N` | the raw N; the core derives its own `n_work` / `n_drain` from it |
+| `m_row_blocks` | `M / 256` |
+| `k_iters` | `K / 512` |
+| epilogue | the `Epilogue` mode |
+| `clamp_min` / `clamp_max` | the bounds, as raw `int32` bit patterns |
+
+A word is not free: each costs ~66 ns per core and the sequence writes
+`ROWS * COLS` = 32 of them, so **every word is ~2 us of dispatch latency**
+(measured by padding the buffer at a fixed core count). Against a ~107 us
+floor that is most of a short-prefill dispatch, so `rtp_layout()` in design.py
+sizes the buffer per configuration rather than sending words a build cannot
+use. Two groups are therefore conditional or gone:
+
+* `n_chunks` / `n_units` are sent **only when `m_chunk > 1`**. They are
+  `m_row_blocks // M_CHUNK` and each other, so at the shipped `M_CHUNK = 1`
+  the core just reads `m_row_blocks`.
+* `n_work` / `n_drain` are **not sent at all**. The core derives them from `N`
+  and its own column, which it reads from a per-tile buffer initialised at
+  build time. Branch-free, and both divisors are powers of two, so it costs
+  shifts rather than a `__divsi3` call:
+
+      n_tiles = N // N_TILE
+      n_work  = (n_tiles - my_col + COLS - 1) // COLS
+      n_drain = ((n_tiles + COLS - 1) // COLS) - n_work
+
+The clamp bounds are the one group that is unconditional despite most callers
+not clamping. The kernel has no unclamped instantiation to compile out: an
+unclamped dispatch sends `(-inf, +inf)`, which leaves every finite value
+bit-identical. Two always-sent words buy one xclbin for clamped and unclamped
+callers alike, which is the whole point of the runtime parameters, and a
+clamping caller now sends one word fewer than the old `clamp_enabled` trio did.
+The bounds stay raw `int32` because `npu_write_rtp` writes i32 only; the kernel
+casts back with `__builtin_bit_cast`, since `memcpy` leaves an unresolved
+external call rather than folding to a register move.
+
+  The column index is per-tile **static data**, deliberately not a constant
+  folded into the program: the 32 core programs today differ only in symbol
+  names, and baking it into code would make them differ in instructions,
+  foreclosing a future one-program xclbin.
+
+Measured on the 30-shape suite at **four** words: **-3.5% median at M=256**
+(best -11.3%, E2B/kv), and within noise at M >= 1024 -- the saving is a
+constant ~12 us, so it is a short-prefill and decode lever, not a prefill one.
+Making the clamp bounds unconditional put two words back, which the ~2 us per
+word above prices at **~4 us of that ~12**; the shape of the result is
+unchanged but the median has not been re-measured since.
+
+All columns are always built. One with no work for a shape gets `n_work = 0`
+and still drains its share of the A broadcast, because the memtile will not
+release an A object until every consumer has taken it.
+
+The two artifacts therefore carry different stems: the xclbin's `config_name`
+covers tile_n, ct_max_k, tile_ma, the compiled activation set, rounding and the
+device, while `name` adds every runtime parameter -- M, K, N, the activation
+and the clamp bounds. It has to: the sequence writes those as immediates and
+the build cache keys on filename and mtime, so a stem that omits one serves the
+first caller's instruction stream to the second. The xclbin is built from a
+module emitted at a reference shape, whose runtime sequence is discarded.
+
+One thing stays build-time, because it costs program memory: which activations
+the epilogue can *select between* (`epilogue_modes`). It lands in the xclbin's
+name. The clamp does not -- every build compiles it, so `clamp=(-2, 2)`,
+`clamp=(-4, 4)` and no clamp at all share one xclbin.
+
+The core releases its barrier straight after reading the parameters.
+`wait_for_value` emits `LockAction.Acquire`, which does not leave the lock
+consumed, so without the release a core that runs twice does not wait the
+second time and reads the previous dispatch's parameters. Releasing before the
+work is safe, because the sequence cannot set the barrier again until it has
+drained this dispatch's C.
+
+The repo's other barrier users never hit this, because neither waits twice:
+`mha` puts its infinite loop *inside* the wait, and `softmax` writes the same
+parameters every dispatch. `test_one_xclbin_serves_every_shape` is the
+regression test -- without the release it hangs the device on the second
+shape, and the parametrised tests cannot catch it, because the `aie_context`
+fixture reconfigures the array between cases.
 
 ## Shape constraints
 
@@ -145,10 +225,11 @@ improves and gelu's worst case drops 5.5%. Measured perf-neutral (0.993-1.006x,
 inside the run-to-run spread).
 
 The shipped kernel selects its activation -- and its shape -- from runtime
-parameters, one overlay serving every projection; this operator bakes both in
-at compile time instead (activation keeps the shipped 0/1/2/3 mapping), which
-is what lets its inner loop be branch-free. See the FLM-compatibility note near
-the top of this file for what that means for using this operator inside FLM.
+parameters, one overlay serving every projection. This operator does the same
+(activation keeps the shipped 0/1/2/3 mapping); see
+[Runtime parameters](#runtime-parameters). Which activations the epilogue can
+*select between* is still a build-time choice, because each one compiled in
+costs program memory.
 
 `clamp` has no counterpart in the shipped overlay to compare against — its
 `generate_seq` never writes the clamp RTP words, so clamping is always off
@@ -201,9 +282,8 @@ to reduce over -- with a single k iteration there is not enough compute to
 hide the extra A traffic.
 
 On NPU2, `tile_n=128` wins only at `k_iters=1`, and by ~3%; at `k_iters>=2` it
-is 1.2-1.7x slower. Both follow from `tile_n=128` giving up resident B — its
-`mt_b` is 128 KB, so `k_iters` copies do not fit the memtile — and the more k
-there is to reduce over, the more that costs.
+is 1.2-1.7x slower, because its `CT_MAX_K` falls to 32 and the compute cost of
+the shorter k slice swamps the A traffic it saves.
 
 NPU1 never reaches that crossover. It has half the columns *and* a quarter of
 the per-tile bf16 mac throughput, so it stays compute-bound at every K, and
@@ -279,7 +359,6 @@ which is why the gap grows with the problem size rather than being flat.
 
 Unlike NPU2, compute here is **not** hidden behind the transfers, so on NPU1
 both a faster mmul and less traffic pay off, where on NPU2 only the latter does.
-Resident B is also a no-op on NPU1 — see [Resident B](#resident-b).
 
 ### Why the transfers are cheap
 
@@ -295,29 +374,47 @@ Two things, both in the runtime sequence rather than the kernel:
   block then costs 3 shim buffer descriptors instead of `1 + 2*k_iters`, so two
   can be in flight without exhausting the 16 available.
 
-### Resident B
+### B is re-fetched per row-block
 
-Where a whole column-block's B fits in the memtile double-buffered
-(`k_iters <= 2`, i.e. K <= 1024 at `tile_n=64`) it is held there and replayed
-per row-block, so DDR reads it once instead of `m_row_blocks` times -- about
-43% less traffic. Larger K falls back to re-reading it, unchanged.
+DDR reads B `m_row_blocks` times rather than once. Holding a whole column-block
+in the memtile and replaying it would size that buffer from `k_iters` and set
+the replay from `m_row_blocks`, putting **both K and M into the device
+configuration** — and the configuration is what one xclbin has to share across
+every shape. That is the standing cost of M, K and N being runtime parameters,
+and it is why B is the dominant DDR leg here.
 
-On NPU2 this is a latency win as well as a power one, because there the
-operator is close to DDR-bandwidth bound, and it grows with the height of the
-problem since B's re-reads scale with `m_row_blocks`. At K=1024 N=4096, min of
-per-round medians over 10 interleaved rounds of 20 dispatches, `npu_time`,
-power mode `turbo`:
+**M is the tractable half.** `aiex.npu.push_queue` takes both `bd_id` and
+`repeat_count` as SSA operands, and `aiex.dma_channel_reset_for(@fifo)` expands
+into the whole re-arm trio a resident fifo needs — channel reset, `aiex.set_lock`
+per bound lock, START_QUEUE re-push — inside the **runtime sequence**, which this
+operator regenerates per shape. So a per-shape replay count does not have to
+reach the xclbin. All of it is reachable from Python and has an npu2 device test
+(1000 dispatches on one hardware context).
 
-| M | row-blocks | non-resident | resident | |
-|---|---|---|---|---|
-| 512 | 2 | 527.0 us | **461.2 us** | 12.5% |
-| 1024 | 4 | 1025.8 us | **857.3 us** | 16.4% |
-| 2048 | 8 | 1958.0 us | **1579.5 us** | 19.3% |
+**K is the part still in the way.** Correct ordering needs one memtile object
+spanning every k-block, so the buffer is sized from `k_iters` and that sizing is
+device configuration. Selecting among several pre-programmed BD chains via
+`push_queue`'s runtime `bd_id` is the obvious line of attack and has not been
+tried.
 
-Most of the available win is still on the table: `repeat_count` restarts the
-memtile BD chain at every replay boundary, which costs part of the traffic
-saving back. Closing that is the largest known remaining lever here.
+### Split legs retire rolling, not in windows
 
-On NPU1 residency is neither a latency nor a power win — measured off-versus-on
-at M=2048 it is at best a no-op and marginally negative at K=1024, well inside
-the 1.4-4.4% round spread.
+Where K or N is 10240, the row-block stride overflows the shim BD's 20-bit
+iteration step and that leg is issued as one transfer per row-block. Two shim
+resources bound how many may be outstanding, and neither is modelled by the
+toolchain: BD ids (16/tile, freed without a completion check) and the channel
+task queue (4 deep, pushed unconditionally).
+
+The sequence retires the **oldest** transfer as it issues the next, which
+bounds both resources directly while keeping the channel full.
+
+**Do not "simplify" this into windowing** — issue four, await the whole window,
+issue the next four. That bounds the same two resources and reads more simply,
+but it drains the channel to *empty* at every window boundary and again at every
+column-block boundary, and on a DDR-rate-bound design those bubbles are the
+entire cost of the split path. Measured at up to **-12.4%** on the shapes that
+take this path (E4B/gateup M1024), for no change in what is in flight.
+
+`m_chunk` takes this path too, since its only structural effect is to force the
+split on for A. It is off by default regardless — see `M_CHUNK_FOR_N` in
+design.py, which would fork the xclbin.
