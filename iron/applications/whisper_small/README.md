@@ -5,68 +5,62 @@ SPDX-License-Identifier: Apache-2.0
 
 # Whisper-small Encoder on Phoenix/NPU1
 
-This application provides experimental Whisper-small encoder support for
-AMD Phoenix/NPU1 using IRON and mlir-aie.
+This example runs the Whisper-small encoder on AMD Phoenix/NPU1 using IRON
+and mlir-aie.
 
-The validated path derives Whisper log-Mel features from real audio on the
-CPU, then executes the convolutional frontend, all 12 encoder transformer
-blocks, and the final encoder LayerNorm on the Phoenix NPU.
+The validated path performs Whisper log-Mel preprocessing on the CPU and runs
+the convolutional frontend, all 12 transformer encoder blocks, and the final
+encoder LayerNorm on the NPU.
 
 > [!NOTE]
-> This is currently an encoder validation application, not a complete
-> speech-to-text implementation. The Whisper decoder and autoregressive
-> generation are not yet implemented.
+> This is an encoder example, not a complete speech-to-text implementation.
+> The Whisper decoder and autoregressive token generation are not implemented.
 
-## Implemented path
+## Model path
 
 ```text
 16-kHz mono PCM16 WAV
         |
         v
-CPU Whisper log-Mel preprocessing
+CPU log-Mel preprocessing
         |
         v
-80 x 128 feature frames
+80 x 128 features
         |
         +---------------- Phoenix/NPU1 ----------------+
         |
         v
-Conv1 -> GELU
-        |
-        v
-Conv2 -> GELU
+Conv1 -> GELU -> Conv2 -> GELU
         |
         v
 64 x 768 encoder tokens
         |
         v
-12 Whisper-small encoder blocks
+12 transformer encoder blocks
         |
         v
 final encoder LayerNorm
 ```
 
-The current Phoenix validation geometry intentionally uses 128 feature
-frames, producing 64 encoder tokens. It does not yet exercise Whisper's
-canonical 3000-frame / 1500-token encoder geometry.
+The current validation geometry uses 128 feature frames and produces 64
+encoder tokens. Whisper's canonical 3000-frame / 1500-token encoder geometry
+is not yet exercised by this example.
 
 ## Requirements
 
-Install IRON and activate an environment containing the IRON/mlir-aie
-runtime dependencies.
+Install IRON and activate an environment containing the IRON/mlir-aie runtime
+dependencies.
 
-The reference utilities additionally require PyTorch and NumPy.
-
-Set `WHISPER_SAFE` to an OpenAI Whisper-small `model.safetensors` file:
+Set `WHISPER_SAFE` to an OpenAI Whisper-small `model.safetensors` checkpoint:
 
 ```powershell
 $env:WHISPER_SAFE = "C:\path\to\whisper-small\model.safetensors"
 ```
 
-Generated validation artifacts are written under `phoenix-whisper-probes`
-by default. Set `IRON_WHISPER_ARTIFACT_DIR` to select another location.
+Generated validation artifacts are written under `phoenix-whisper-probes` by
+default. Set `IRON_WHISPER_ARTIFACT_DIR` to select another location.
 
-## Controlled validation
+## Run the example
 
 Generate deterministic FP32 references:
 
@@ -74,7 +68,7 @@ Generate deterministic FP32 references:
 python iron/applications/whisper_small/whisper_encoder.py --prepare-reference
 ```
 
-Run the Phoenix frontend and complete 12-block encoder:
+Run the Phoenix encoder against existing references:
 
 ```text
 python iron/applications/whisper_small/whisper_encoder.py --run
@@ -86,13 +80,43 @@ Generate references and run the complete validation:
 python iron/applications/whisper_small/whisper_encoder.py --all
 ```
 
-The encoder driver also accepts explicit frontend/reference/output artifact
-paths; use `--help` for the complete command-line interface.
+Use `--help` for optional reference and output paths.
 
-## Real-audio validation
+## Implementation
 
-`whisper_audio.py` implements the Whisper audio preprocessing used by the
-real-speech validation path:
+`whisper_frontend.py` implements the NPU convolutional frontend. Whisper's
+Conv1D operations are lowered to BF16 GEMMs:
+
+- Conv1 uses logical K=240 padded to K=256.
+- Conv2 uses K=2304.
+- Conv2's logical 64-row output is executed with physical M=128 and sliced
+  back to 64 rows.
+
+`whisper_encoder.py` executes the frontend, all 12 transformer blocks, and
+the final LayerNorm in the same Python process. The implementation uses the
+LayerNorm, GELU, Softmax, and GEMM operators provided by the current
+IRON/mlir-aie stack; no application-specific changes to those generic
+operators are required.
+
+The FP32 reference generators are separate from the NPU inference path and
+are used only for numerical validation.
+
+## Validation
+
+The deterministic 128-frame / 64-token validation completes all frontend and
+encoder stages with finite outputs.
+
+Current Phoenix/NPU1 results against the FP32 reference are approximately:
+
+| Stage | NRMSE | Cosine similarity |
+| --- | ---: | ---: |
+| Frontend / Block-0 input | 0.768% | 0.999984 |
+| Final encoder output | 7.99% | 0.996817 |
+
+The final encoder output from the single-process implementation was also
+verified to be bit-identical to the previously validated implementation.
+
+`whisper_audio.py` implements the real-audio preprocessing path:
 
 ```text
 PCM16 WAV
@@ -104,66 +128,15 @@ PCM16 WAV
   -> Whisper normalization
 ```
 
-The implementation was independently compared with Hugging Face's
-`WhisperFeatureExtractor`. For the preprocessing oracle, the maximum
-absolute error was approximately `1.19e-7` with RMSE approximately
-`5.13e-9`.
-
-Real-speech validation used the LibriSpeech dummy validation sample
-`1272-128104-0000` from
-`hf-internal-testing/librispeech_asr_dummy`.
-
-For that input, the Phoenix frontend Block-0 input comparison against the
-FP32 reference measured approximately:
-
-| Metric | Result |
-| --- | ---: |
-| Max absolute error | 0.03118 |
-| Mean absolute error | 0.001177 |
-| RMSE | 0.002496 |
-| NRMSE | 0.280% |
-| Cosine similarity | 0.999996 |
-
-All 12 encoder blocks and the final encoder LayerNorm completed with finite
-outputs in the original real-speech validation. That validation measured
-approximately `2.554%` NRMSE and `0.999674` cosine similarity at the final
-encoder output.
-
-A subsequent validation against the current upstream IRON/mlir-aie stack used
-the deterministic 128-frame / 64-token configuration. The complete encoder
-executed successfully with finite outputs and normal teardown. Its final
-encoder comparison against the FP32 reference measured approximately `7.99%`
-NRMSE with `0.9968` cosine similarity.
-
-Exact-input operator checks on the current stack remained substantially closer
-to their mathematical references. The observed late-encoder difference
-accumulates and is amplified across encoder depth; the current validation did
-not identify a single LayerNorm, GELU, Softmax, or GEMM operation as its sole
-cause.
-
-See [ENGINEERING_EXPERIENCE.md](ENGINEERING_EXPERIENCE.md) for validation
-methodology and numerical investigation details.
-
-## Phoenix implementation notes
-
-The frontend lowers Whisper's Conv1D operations to Phoenix BF16 GEMMs.
-Conv1 uses logical K=240 padded to K=256. Conv2 uses K=2304, and its
-logical 64-row result is physically padded to M=128 for the Phoenix GEMM
-before slicing back to 64 rows.
-
-Encoder blocks intentionally execute in fresh Python subprocesses. This
-keeps the number of simultaneously live XRT kernel handles bounded on the
-tested Phoenix/XRT configuration.
-
-The encoder uses the LayerNorm, GELU, Softmax, and GEMM operators provided by
-the current IRON/mlir-aie stack; no application-specific modifications to
-those generic operators are required by this validation path.
+The preprocessing implementation was independently compared with Hugging
+Face's `WhisperFeatureExtractor`, with approximately `1.19e-7` maximum
+absolute error and `5.13e-9` RMSE.
 
 ## Current limitations
 
-The following are outside the validated scope of this application:
+The following are outside the validated scope of this example:
 
-- canonical 3000-frame / 1500-token Whisper encoder execution
+- canonical 3000-frame / 1500-token encoder execution
 - Whisper decoder
 - causal decoder self-attention
 - encoder-decoder cross-attention
@@ -171,9 +144,5 @@ The following are outside the validated scope of this application:
 - autoregressive token generation
 - tokenizer/generation integration
 - end-to-end speech transcription
-- complete 12-block controlled encoder execution on the clean current-upstream
-  IRON/mlir-aie stack without application-specific generic operator patches;
-- current-upstream stage-level numerical characterization through the final
-  encoder LayerNorm.
 
 The next implementation boundary is the Whisper decoder.
