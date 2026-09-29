@@ -5,8 +5,12 @@
 import pytest
 
 from iron.operators.elementwise_add.op import ElementwiseAdd
-from iron.operators.elementwise_add.reference import generate_golden_reference
-from iron.common.test_utils import run_test, make_binary_elementwise_params, suite_marks
+from iron.operators.elementwise_add.reference import generate_inputs
+from iron.common.test_utils import (
+    assert_matches_reference,
+    make_binary_elementwise_params,
+    suite_marks,
+)
 
 
 def get_params():
@@ -27,7 +31,7 @@ def get_params():
     get_params(),
 )
 def test_elementwise_add(input_length, num_aie_columns, tile_size, aie_context):
-    golden_ref = generate_golden_reference(input_length=input_length)
+    a, b = generate_inputs(input_length=input_length)
 
     operator = ElementwiseAdd(
         size=input_length,
@@ -36,14 +40,4 @@ def test_elementwise_add(input_length, num_aie_columns, tile_size, aie_context):
         context=aie_context,
     )
 
-    input_buffers = {"input1": golden_ref["A"], "input2": golden_ref["B"]}
-    output_buffers = {"output": golden_ref["C"]}
-
-    errors, latency_us, bandwidth_gbps = run_test(
-        operator, input_buffers, output_buffers, rel_tol=0.04, abs_tol=1e-6
-    )
-
-    print(f"\nLatency (us): {latency_us:.1f}")
-    print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s\n")
-
-    assert not errors, f"Test failed with errors: {errors}"
+    assert_matches_reference(operator, a, b)
