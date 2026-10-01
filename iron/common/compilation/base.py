@@ -60,6 +60,10 @@ from aie.utils.compile.utils import (
     prefix_symbols_in_object,
 )
 
+# compile_dispatch_bridge() is private to mlir-aie's JIT. mlir-aie can change
+# it without notice.
+from aie.utils.compile.jit._dispatch_compile import compile_dispatch_bridge
+
 # Global Functions
 # ##########################################################################
 
@@ -398,6 +402,40 @@ class InstsBinArtifact(_MLIRInputMixin, CompilationArtifact):
             dependencies = dependencies + [mlir_input]
         super().__init__(filename, dependencies)
         self.extra_flags = extra_flags if extra_flags is not None else []
+
+
+class DispatchLibArtifact(_MLIRInputMixin, CompilationArtifact):
+    """A host library that generates an operator's instruction stream per dispatch.
+
+    It serves a design whose runtime sequence takes scalars.
+    aiecc translates the runtime sequence to C++. The library runs that C++
+    with the scalars of each dispatch.
+    """
+
+    def __init__(
+        self,
+        filename: str,
+        mlir_input: CompilationArtifact,
+        dependencies: list[CompilationArtifact],
+        dispatch_params: dict[str, type],
+    ) -> None:
+        if mlir_input not in dependencies:
+            dependencies = dependencies + [mlir_input]
+        super().__init__(filename, dependencies)
+        self.dispatch_params = dict(dispatch_params)
+
+    @property
+    def cpp_filename(self) -> str:
+        """The generated C++, for a host that compiles the generator in."""
+        return str(Path(self.filename).with_suffix(".cpp"))
+
+    def is_available_in_filesystem(self) -> bool:
+        cpp = Path(self.cpp_filename)
+        return (
+            super().is_available_in_filesystem()
+            and cpp.exists()
+            and os.path.getmtime(cpp) >= os.path.getmtime(self.filename)
+        )
 
 
 class KernelObjectArtifact(CompilationArtifact):
@@ -741,16 +779,47 @@ class AieccFullElfCompilationRule(AieccCompilationRule):
         return commands
 
 
+# The name under which compile_dispatch_bridge() reads aiecc's C++.
+_DISPATCH_CPP = "dispatch_gen.cpp"
+
+
+def _build_dispatch_lib(work_dir: Path, artifact: DispatchLibArtifact) -> None:
+    """Compile aiecc's generated C++ in work_dir into artifact's library."""
+    library = compile_dispatch_bridge(
+        work_dir,
+        list(artifact.dispatch_params),
+        list(artifact.dispatch_params.values()),
+    ).resolve()
+    # compile_dispatch_bridge() names each library by a digest of its content.
+    # The artifact is a link to that library. get_callable() loads the link's
+    # target. A rebuilt library therefore reaches a running process under a new
+    # path. Under one fixed path, the dynamic loader returns the library it
+    # loaded first.
+    link = Path(artifact.filename)
+    link.unlink(missing_ok=True)
+    link.symlink_to(library)
+    # compile_dispatch_bridge() keeps an existing library of the same content.
+    # Its mtime can predate the MLIR. The build then marks the link out of date
+    # on every run.
+    os.utime(library)
+    shutil.copyfile(work_dir / _DISPATCH_CPP, artifact.cpp_filename)
+
+
 class AieccXclbinInstsCompilationRule(AieccCompilationRule):
     def matches(self, graph):
-        return any(graph.get_worklist((XclbinArtifact, InstsBinArtifact)))
+        return any(
+            graph.get_worklist((XclbinArtifact, InstsBinArtifact, DispatchLibArtifact))
+        )
 
     def compile(self, graph):
         # If there are both xclbin and insts.bin targets based on the same source MLIR code, we can combine them into one single `aiecc.py` invocation.
         mlir_sources = set()
         mlir_sources_to_xclbins = {}
         mlir_sources_to_insts = {}
-        worklist = graph.get_worklist((XclbinArtifact, InstsBinArtifact))
+        mlir_sources_to_dispatch_libs = {}
+        worklist = graph.get_worklist(
+            (XclbinArtifact, InstsBinArtifact, DispatchLibArtifact)
+        )
         for artifact in worklist:
             mlir_dependency = artifact.mlir_input
             mlir_sources.add(mlir_dependency)
@@ -758,6 +827,30 @@ class AieccXclbinInstsCompilationRule(AieccCompilationRule):
                 mlir_sources_to_xclbins.setdefault(mlir_dependency, []).append(artifact)
             elif isinstance(artifact, InstsBinArtifact):
                 mlir_sources_to_insts.setdefault(mlir_dependency, []).append(artifact)
+            elif isinstance(artifact, DispatchLibArtifact):
+                mlir_sources_to_dispatch_libs.setdefault(mlir_dependency, []).append(
+                    artifact
+                )
+
+        # A generator writes to addresses that its xclbin's aiecc run
+        # allocates. The rule therefore builds both whenever either is out of
+        # date.
+        paired = mlir_sources & {
+            a.mlir_input for a in graph.bfs() if isinstance(a, DispatchLibArtifact)
+        }
+        for artifact in graph.bfs():
+            if (
+                isinstance(artifact, (XclbinArtifact, DispatchLibArtifact))
+                and artifact.mlir_input in paired
+                and artifact not in worklist
+            ):
+                sources_to = (
+                    mlir_sources_to_xclbins
+                    if isinstance(artifact, XclbinArtifact)
+                    else mlir_sources_to_dispatch_libs
+                )
+                sources_to.setdefault(artifact.mlir_input, []).append(artifact)
+                worklist.append(artifact)
 
         commands = []
         # Now we know for each mlir source if we need to generate an xclbin, an insts.bin or both for it
@@ -789,10 +882,19 @@ class AieccXclbinInstsCompilationRule(AieccCompilationRule):
 
             work_dir = _aiecc_work_dir(mlir_source.filename)
 
+            # The generator and the xclbin come from one aiecc run: the
+            # generated sequence writes to addresses that this run allocates.
+            dispatch_libs = mlir_sources_to_dispatch_libs.get(mlir_source, [])
+            npu_cpp_path = None
+            if dispatch_libs:
+                npu_cpp_path = work_dir / _DISPATCH_CPP
+                options.append("--get=npu_lowered.mlir")
+
             def _compile(
                 mlir_source=mlir_source,
                 xclbin_path=xclbin_path,
                 insts_path=insts_path,
+                npu_cpp_path=npu_cpp_path,
                 options=options,
                 work_dir=work_dir,
             ):
@@ -802,6 +904,8 @@ class AieccXclbinInstsCompilationRule(AieccCompilationRule):
                     Path(mlir_source.filename).read_text(),
                     insts_path=insts_path,
                     xclbin_path=xclbin_path,
+                    npu_cpp_path=npu_cpp_path,
+                    npu_cpp_emit_dispatch_shim=npu_cpp_path is not None,
                     work_dir=str(work_dir),
                     options=options,
                     use_chess=self.use_chess,
@@ -809,6 +913,12 @@ class AieccXclbinInstsCompilationRule(AieccCompilationRule):
                 )
 
             commands.append(PythonCallbackCompilationCommand(_compile))
+            for artifact in dispatch_libs:
+                commands.append(
+                    PythonCallbackCompilationCommand(
+                        partial(_build_dispatch_lib, work_dir, artifact)
+                    )
+                )
 
             # There may be multiple targets that require an xclbin/insts.bin from the same MLIR with different names; copy them
             for sources_to in [mlir_sources_to_xclbins, mlir_sources_to_insts]:

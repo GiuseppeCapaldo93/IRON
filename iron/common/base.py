@@ -13,6 +13,7 @@ from typing import Any, Callable, ClassVar
 import numpy as np
 from ml_dtypes import bfloat16
 import aie.utils as aie_utils
+from aie.utils.compile.utils import SHARED_LIB_SUFFIX
 from aie.utils.npukernel import NPUKernel
 from aie.utils.verify import Tolerance
 
@@ -24,6 +25,7 @@ from .compilation import (
     CompilationArtifact,
     XclbinArtifact,
     InstsBinArtifact,
+    DispatchLibArtifact,
     KernelObjectArtifact,
     KernelArchiveArtifact,
     SourceArtifact,
@@ -171,9 +173,31 @@ class MLIROperator(AIEOperatorBase):
             return None
         return kernel.contract.tolerance
 
+    def get_dispatch_params(self) -> dict[str, type]:
+        """The scalars the runtime sequence takes, by name, in argument order.
+
+        Each value is the NumPy scalar type the sequence declares, e.g.
+        ``np.int32``. Scalars can set loop bounds and DMA sizes, so an operator
+        that declares them has no single instruction stream. It builds a
+        library that generates the stream in place of a ``.bin``. Its callable
+        is a :class:`DispatchCallable`.
+        """
+        return {}
+
     def get_artifacts(
         self, prefix: str = ""
     ) -> tuple[XclbinArtifact, InstsBinArtifact]:
+        if self.get_dispatch_params():
+            raise NotImplementedError(
+                f"{type(self).__name__} generates its instruction stream per "
+                "dispatch and has no .bin to sequence"
+            )
+        return self._artifacts(prefix)
+
+    def _artifacts(
+        self, prefix: str = ""
+    ) -> tuple[XclbinArtifact, InstsBinArtifact | DispatchLibArtifact]:
+        """The xclbin, and the ``.bin`` or the library that generates the stream."""
         operator_name = prefix + self.name
         mlir_artifact = self.get_mlir_artifact()
         kernel_deps = self.get_kernel_artifacts()
@@ -182,20 +206,40 @@ class MLIROperator(AIEOperatorBase):
             mlir_input=mlir_artifact,
             dependencies=[mlir_artifact] + kernel_deps,
         )
-        insts_artifact = InstsBinArtifact(
-            f"{operator_name}.bin",
+        dispatch_params = self.get_dispatch_params()
+        if not dispatch_params:
+            return xclbin_artifact, InstsBinArtifact(
+                f"{operator_name}.bin",
+                mlir_input=mlir_artifact,
+                dependencies=[mlir_artifact],
+            )
+        return xclbin_artifact, DispatchLibArtifact(
+            f"{operator_name}{SHARED_LIB_SUFFIX}",
             mlir_input=mlir_artifact,
-            dependencies=[mlir_artifact],
+            # aiecc compiles the cores on the way to the sequence.
+            dependencies=[mlir_artifact] + kernel_deps,
+            dispatch_params=dispatch_params,
         )
-        return xclbin_artifact, insts_artifact
 
     def set_up_artifacts(self) -> None:
-        xclbin_artifact, insts_artifact = self.get_artifacts()
-        self.xclbin_artifact = xclbin_artifact
-        self.insts_artifact = insts_artifact
-        self.add_artifacts([xclbin_artifact, insts_artifact])
+        self.xclbin_artifact, stream_artifact = self._artifacts()
+        if isinstance(stream_artifact, DispatchLibArtifact):
+            self.dispatch_artifact = stream_artifact
+        else:
+            self.insts_artifact = stream_artifact
+        self.add_artifacts([self.xclbin_artifact, stream_artifact])
 
     def get_callable(self) -> Callable[..., Any]:
+        dispatch_params = self.get_dispatch_params()
+        if dispatch_params:
+            return DispatchCallable(
+                NPUKernel(
+                    xclbin_path=self.xclbin_artifact.filename,
+                    kernel_name=self.xclbin_artifact.kernel_name,
+                    dispatch_params=list(dispatch_params),
+                    dispatch_lib_path=Path(self.dispatch_artifact.filename).resolve(),
+                )
+            )
         npu_kernel = NPUKernel(
             xclbin_path=self.xclbin_artifact.filename,
             kernel_name=self.xclbin_artifact.kernel_name,
@@ -207,6 +251,35 @@ class MLIROperator(AIEOperatorBase):
             return aie_utils.DefaultNPURuntime.run(handle, list(args))
 
         return call
+
+
+class DispatchCallable:
+    """Runs an operator whose instruction stream depends on dispatch parameters.
+
+    ``set_parameters()`` sets the parameters of every later call. Each call
+    generates the instruction stream for those parameters and runs it.
+    """
+
+    def __init__(self, npu_kernel: NPUKernel) -> None:
+        self._npu_kernel = npu_kernel
+        self._params: dict[str, int] | None = None
+
+    def set_parameters(self, **params: int) -> None:
+        expected = self._npu_kernel.dispatch_params
+        if sorted(params) != sorted(expected):
+            raise TypeError(
+                f"set_parameters() takes exactly {expected}, got {sorted(params)}"
+            )
+        self._params = params
+
+    def __call__(self, *args):
+        if self._params is None:
+            raise RuntimeError(
+                "call set_parameters() before the first call: the instruction "
+                "stream depends on them"
+            )
+        _, result = self._npu_kernel(*args, **self._params)
+        return result
 
 
 class CompositeOperator(AIEOperatorBase):
