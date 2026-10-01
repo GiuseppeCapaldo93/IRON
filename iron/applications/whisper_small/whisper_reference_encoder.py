@@ -247,7 +247,6 @@ with safe_open(
 
         mlp_act = F.gelu(
             mlp_up,
-            approximate="tanh",
         )
 
         mlp_down = F.linear(

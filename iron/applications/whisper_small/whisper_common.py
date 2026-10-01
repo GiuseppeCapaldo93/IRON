@@ -41,7 +41,7 @@ def whisper_checkpoint() -> Path:
             "Whisper-small model.safetensors checkpoint."
         )
 
-    path = Path(value).expanduser().resolve()
+    path = Path(value).expanduser()
 
     if not path.is_file():
         raise FileNotFoundError(f"Whisper checkpoint not found: {path}")

@@ -3,6 +3,7 @@
 
 import argparse
 import gc
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -224,9 +225,25 @@ def run_attention(
         ),
     )
 
-    gemm64 = GEMM(
+    score_gemm = GEMM(
         M=SEQ,
         K=HEAD_DIM,
+        N=SEQ,
+        num_aie_columns=1,
+        tile_m=16,
+        tile_k=64,
+        tile_n=64,
+        prio_accuracy=True,
+        emulate_bf16_mmul_with_bfp16=False,
+        context=make_context(
+            build_root,
+            "score-gemm",
+        ),
+    )
+
+    value_gemm = GEMM(
+        M=SEQ,
+        K=SEQ,
         N=HEAD_DIM,
         num_aie_columns=1,
         tile_m=16,
@@ -236,7 +253,7 @@ def run_attention(
         emulate_bf16_mmul_with_bfp16=False,
         context=make_context(
             build_root,
-            "gemm64",
+            "value-gemm",
         ),
     )
 
@@ -257,8 +274,11 @@ def run_attention(
     gemm768.compile()
     gemm768_fn = gemm768.get_callable()
 
-    gemm64.compile()
-    gemm64_fn = gemm64.get_callable()
+    score_gemm.compile()
+    score_gemm_fn = score_gemm.get_callable()
+
+    value_gemm.compile()
+    value_gemm_fn = value_gemm.get_callable()
 
     softmax.compile()
     softmax_fn = softmax.get_callable()
@@ -313,7 +333,7 @@ def run_attention(
         for head in range(HEADS):
             scores[head] = (
                 run_gemm(
-                    gemm64_fn,
+                    score_gemm_fn,
                     qh[head],
                     kh[head].transpose(0, 1).contiguous(),
                     (SEQ, SEQ),
@@ -354,7 +374,7 @@ def run_attention(
         for head in range(HEADS):
             heads.append(
                 run_gemm(
-                    gemm64_fn,
+                    value_gemm_fn,
                     probs[head],
                     vh[head],
                     (SEQ, HEAD_DIM),
@@ -382,8 +402,10 @@ def run_attention(
     finally:
         del softmax_fn
         del softmax
-        del gemm64_fn
-        del gemm64
+        del value_gemm_fn
+        del value_gemm
+        del score_gemm_fn
+        del score_gemm
         del gemm768_fn
         del gemm768
         del ln_fn
@@ -645,8 +667,10 @@ def run_reference_script(
     )
 
 
-def prepare_reference() -> None:
-    """Generate the deterministic FP32 frontend and encoder oracle."""
+def prepare_reference(
+    wav: Path,
+) -> None:
+    """Generate the real-audio FP32 frontend and encoder oracle."""
 
     # Validate checkpoint configuration before spawning children.
     checkpoint = whisper_checkpoint()
@@ -656,8 +680,20 @@ def prepare_reference() -> None:
         checkpoint,
     )
 
+    wav = wav.expanduser()
+
+    if not wav.is_file():
+        raise FileNotFoundError(f"Whisper validation WAV not found: {wav}")
+
+    print(
+        "Validation WAV:",
+        wav,
+    )
+
     run_reference_script(
         "whisper_reference_frontend.py",
+        "--wav",
+        wav,
     )
 
     if not FRONTEND_REFERENCE.is_file():
@@ -847,9 +883,7 @@ def main() -> None:
     mode.add_argument(
         "--prepare-reference",
         action="store_true",
-        help=(
-            "Generate deterministic FP32 frontend and " "encoder reference artifacts."
-        ),
+        help=("Generate real-audio FP32 frontend and " "encoder reference artifacts."),
     )
 
     mode.add_argument(
@@ -867,6 +901,17 @@ def main() -> None:
         help=(
             "Generate references and then run the complete "
             "Phoenix encoder validation."
+        ),
+    )
+
+    parser.add_argument(
+        "--wav",
+        type=Path,
+        default=None,
+        help=(
+            "16-kHz mono PCM16 WAV used to generate "
+            "the FP32 validation references. "
+            "Defaults to WHISPER_TEST_WAV."
         ),
     )
 
@@ -893,13 +938,24 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    wav = args.wav
+
+    if wav is None:
+        wav_value = os.environ.get("WHISPER_TEST_WAV")
+
+        if wav_value:
+            wav = Path(wav_value)
+
     ARTIFACT_ROOT.mkdir(
         parents=True,
         exist_ok=True,
     )
 
     if args.prepare_reference:
-        prepare_reference()
+        if wav is None:
+            parser.error("--prepare-reference requires --wav " "or WHISPER_TEST_WAV")
+
+        prepare_reference(wav)
         return
 
     if args.run:
@@ -911,7 +967,10 @@ def main() -> None:
         return
 
     if args.all:
-        prepare_reference()
+        if wav is None:
+            parser.error("--all requires --wav " "or WHISPER_TEST_WAV")
+
+        prepare_reference(wav)
         run_phoenix()
         return
 
