@@ -166,7 +166,6 @@ conv1 = F.conv1d(
 
 gelu1 = F.gelu(
     conv1,
-    approximate="tanh",
 )
 
 conv2 = F.conv1d(
@@ -179,7 +178,6 @@ conv2 = F.conv1d(
 
 gelu2 = F.gelu(
     conv2,
-    approximate="tanh",
 )
 
 tokens = gelu2.squeeze(0).transpose(0, 1).contiguous()

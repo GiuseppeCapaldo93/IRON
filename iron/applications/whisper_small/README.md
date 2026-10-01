@@ -57,12 +57,21 @@ Set `WHISPER_SAFE` to an OpenAI Whisper-small `model.safetensors` checkpoint:
 $env:WHISPER_SAFE = "C:\path\to\whisper-small\model.safetensors"
 ```
 
+Reference generation also requires a 16-kHz mono PCM16 WAV. Set
+`WHISPER_TEST_WAV` to the validation audio:
+
+```powershell
+$env:WHISPER_TEST_WAV = "C:\path\to\validation.wav"
+```
+
+Alternatively, pass the WAV explicitly with `--wav`.
+
 Generated validation artifacts are written under `phoenix-whisper-probes` by
 default. Set `IRON_WHISPER_ARTIFACT_DIR` to select another location.
 
 ## Run the example
 
-Generate deterministic FP32 references:
+Generate real-audio FP32 references:
 
 ```text
 python iron/applications/whisper_small/whisper_encoder.py --prepare-reference
@@ -80,7 +89,7 @@ Generate references and run the complete validation:
 python iron/applications/whisper_small/whisper_encoder.py --all
 ```
 
-Use `--help` for optional reference and output paths.
+Use `--wav` to override `WHISPER_TEST_WAV`. Use `--help` for optional reference and output paths.
 
 ## Implementation
 
@@ -103,18 +112,23 @@ are used only for numerical validation.
 
 ## Validation
 
-The deterministic 128-frame / 64-token validation completes all frontend and
-encoder stages with finite outputs.
+The 128-frame / 64-token validation uses real audio and completes all frontend
+and encoder stages with finite outputs. The FP32 reference uses exact GELU,
+matching the Whisper model configuration.
 
-Current Phoenix/NPU1 results against the FP32 reference are approximately:
+On the validated real-audio sample, the final Phoenix/NPU1 encoder output
+measured approximately:
 
-| Stage | NRMSE | Cosine similarity |
-| --- | ---: | ---: |
-| Frontend / Block-0 input | 0.768% | 0.999984 |
-| Final encoder output | 7.99% | 0.996817 |
+| Stage | NRMSE | RMSE | Cosine similarity |
+| --- | ---: | ---: | ---: |
+| Final encoder output | 4.706% | 0.06755 | 0.998893 |
 
-The final encoder output from the single-process implementation was also
-verified to be bit-identical to the previously validated implementation.
+The pytest hardware validation enforces a maximum final encoder NRMSE of
+`5.0%`. Five consecutive validation iterations reproduced the same final
+metrics.
+
+The attention score and value GEMMs use their logical sequence dimensions
+rather than relying on the current `SEQ == HEAD_DIM == 64` geometry.
 
 `whisper_audio.py` implements the real-audio preprocessing path:
 
