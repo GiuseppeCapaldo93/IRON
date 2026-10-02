@@ -812,6 +812,942 @@ def run_decoder_block(
     return x
 
 
+# -----------------------------------------------------------------
+# Cached decoder execution
+#
+# These paths were validated by the D4 Phoenix prefill and
+# incremental-cache experiments before promotion into the decoder.
+# -----------------------------------------------------------------
+
+
+def run_self_attention_with_cache(
+    x,
+    weights,
+    build_root,
+):
+    logical_rows = x.shape[0]
+
+    x_norm = run_layernorm(
+        x=x,
+        weight=weights["self_attn_layer_norm.weight"],
+        bias=weights["self_attn_layer_norm.bias"],
+        build_root=(build_root / "ln"),
+    )
+
+    projection = GEMM(
+        M=DECODER_PHYSICAL_SEQ,
+        K=STATE,
+        N=STATE,
+        num_aie_columns=1,
+        tile_m=16,
+        tile_k=64,
+        tile_n=64,
+        prio_accuracy=True,
+        emulate_bf16_mmul_with_bfp16=False,
+        context=make_context(
+            build_root,
+            "projection",
+        ),
+    )
+
+    projection.compile()
+    projection_fn = projection.get_callable()
+
+    q = run_projection(
+        projection_fn,
+        x_norm,
+        weights["self_attn.q_proj.weight"],
+        weights["self_attn.q_proj.bias"],
+        logical_rows,
+    )
+
+    k = run_projection(
+        projection_fn,
+        x_norm,
+        weights["self_attn.k_proj.weight"],
+        None,
+        logical_rows,
+    )
+
+    v = run_projection(
+        projection_fn,
+        x_norm,
+        weights["self_attn.v_proj.weight"],
+        weights["self_attn.v_proj.bias"],
+        logical_rows,
+    )
+
+    del projection_fn
+    del projection
+    gc.collect()
+
+    qh = split_heads(q)
+    kh = split_heads(k)
+    vh = split_heads(v)
+
+    score_gemm = GEMM(
+        M=DECODER_PHYSICAL_SEQ,
+        K=HEAD_DIM,
+        N=DECODER_PHYSICAL_SEQ,
+        num_aie_columns=1,
+        tile_m=16,
+        tile_k=64,
+        tile_n=64,
+        prio_accuracy=True,
+        emulate_bf16_mmul_with_bfp16=False,
+        context=make_context(
+            build_root,
+            "score-gemm",
+        ),
+    )
+
+    score_gemm.compile()
+    score_fn = score_gemm.get_callable()
+
+    scores = torch.empty(
+        (
+            HEADS,
+            logical_rows,
+            logical_rows,
+        ),
+        dtype=torch.float32,
+    )
+
+    for head in range(HEADS):
+        q_pad = torch.zeros(
+            (
+                DECODER_PHYSICAL_SEQ,
+                HEAD_DIM,
+            ),
+            dtype=torch.float32,
+        )
+
+        k_t_pad = torch.zeros(
+            (
+                HEAD_DIM,
+                DECODER_PHYSICAL_SEQ,
+            ),
+            dtype=torch.float32,
+        )
+
+        q_pad[:logical_rows] = qh[head] * SCALE
+
+        k_t_pad[
+            :,
+            :logical_rows,
+        ] = (
+            kh[head].transpose(0, 1).contiguous()
+        )
+
+        physical_scores = run_gemm(
+            score_fn,
+            q_pad,
+            k_t_pad,
+            (
+                DECODER_PHYSICAL_SEQ,
+                DECODER_PHYSICAL_SEQ,
+            ),
+        )
+
+        scores[head] = physical_scores[
+            :logical_rows,
+            :logical_rows,
+        ]
+
+    del score_fn
+    del score_gemm
+    gc.collect()
+
+    causal_mask = torch.triu(
+        torch.ones(
+            logical_rows,
+            logical_rows,
+            dtype=torch.bool,
+        ),
+        diagonal=1,
+    )
+
+    scores = scores.masked_fill(
+        causal_mask,
+        torch.finfo(scores.dtype).min,
+    )
+
+    probs = torch.softmax(
+        scores,
+        dim=-1,
+        dtype=torch.float32,
+    )
+
+    context = merge_heads(
+        torch.matmul(
+            probs,
+            vh,
+        )
+    )
+
+    out_projection = GEMM(
+        M=DECODER_PHYSICAL_SEQ,
+        K=STATE,
+        N=STATE,
+        num_aie_columns=1,
+        tile_m=16,
+        tile_k=64,
+        tile_n=64,
+        prio_accuracy=True,
+        emulate_bf16_mmul_with_bfp16=False,
+        context=make_context(
+            build_root,
+            "out-projection",
+        ),
+    )
+
+    out_projection.compile()
+
+    out_fn = out_projection.get_callable()
+
+    projected = run_projection(
+        out_fn,
+        context,
+        weights["self_attn.out_proj.weight"],
+        weights["self_attn.out_proj.bias"],
+        logical_rows,
+    )
+
+    del out_fn
+    del out_projection
+    gc.collect()
+
+    return (
+        x + projected,
+        kh,
+        vh,
+    )
+
+
+def run_cross_attention_with_cache(
+    x,
+    encoder,
+    weights,
+    build_root,
+):
+    logical_rows = x.shape[0]
+
+    if encoder.shape != (
+        ENCODER_SEQ,
+        STATE,
+    ):
+        raise ValueError("Unexpected encoder shape: " f"{tuple(encoder.shape)}")
+
+    x_norm = run_layernorm(
+        x=x,
+        weight=weights["encoder_attn_layer_norm.weight"],
+        bias=weights["encoder_attn_layer_norm.bias"],
+        build_root=(build_root / "ln"),
+    )
+
+    projection = GEMM(
+        M=DECODER_PHYSICAL_SEQ,
+        K=STATE,
+        N=STATE,
+        num_aie_columns=1,
+        tile_m=16,
+        tile_k=64,
+        tile_n=64,
+        prio_accuracy=True,
+        emulate_bf16_mmul_with_bfp16=False,
+        context=make_context(
+            build_root,
+            "projection",
+        ),
+    )
+
+    projection.compile()
+
+    projection_fn = projection.get_callable()
+
+    q = run_projection(
+        projection_fn,
+        x_norm,
+        weights["encoder_attn.q_proj.weight"],
+        weights["encoder_attn.q_proj.bias"],
+        logical_rows,
+    )
+
+    k = run_gemm(
+        projection_fn,
+        encoder,
+        weights["encoder_attn.k_proj.weight"].transpose(0, 1).contiguous(),
+        (
+            ENCODER_SEQ,
+            STATE,
+        ),
+    )
+
+    v = run_gemm(
+        projection_fn,
+        encoder,
+        weights["encoder_attn.v_proj.weight"].transpose(0, 1).contiguous(),
+        (
+            ENCODER_SEQ,
+            STATE,
+        ),
+    )
+
+    v += weights["encoder_attn.v_proj.bias"]
+
+    del projection_fn
+    del projection
+    gc.collect()
+
+    qh = split_heads(q)
+    kh = split_heads(k)
+    vh = split_heads(v)
+
+    score_gemm = GEMM(
+        M=DECODER_PHYSICAL_SEQ,
+        K=HEAD_DIM,
+        N=ENCODER_SEQ,
+        num_aie_columns=1,
+        tile_m=16,
+        tile_k=64,
+        tile_n=64,
+        prio_accuracy=True,
+        emulate_bf16_mmul_with_bfp16=False,
+        context=make_context(
+            build_root,
+            "score-gemm",
+        ),
+    )
+
+    score_gemm.compile()
+
+    score_fn = score_gemm.get_callable()
+
+    scores = torch.empty(
+        (
+            HEADS,
+            logical_rows,
+            ENCODER_SEQ,
+        ),
+        dtype=torch.float32,
+    )
+
+    for head in range(HEADS):
+        q_pad = torch.zeros(
+            (
+                DECODER_PHYSICAL_SEQ,
+                HEAD_DIM,
+            ),
+            dtype=torch.float32,
+        )
+
+        q_pad[:logical_rows] = qh[head] * SCALE
+
+        physical_scores = run_gemm(
+            score_fn,
+            q_pad,
+            kh[head].transpose(0, 1).contiguous(),
+            (
+                DECODER_PHYSICAL_SEQ,
+                ENCODER_SEQ,
+            ),
+        )
+
+        scores[head] = physical_scores[:logical_rows, :]
+
+    del score_fn
+    del score_gemm
+    gc.collect()
+
+    probs = torch.softmax(
+        scores,
+        dim=-1,
+        dtype=torch.float32,
+    )
+
+    context = merge_heads(
+        torch.matmul(
+            probs,
+            vh,
+        )
+    )
+
+    out_projection = GEMM(
+        M=DECODER_PHYSICAL_SEQ,
+        K=STATE,
+        N=STATE,
+        num_aie_columns=1,
+        tile_m=16,
+        tile_k=64,
+        tile_n=64,
+        prio_accuracy=True,
+        emulate_bf16_mmul_with_bfp16=False,
+        context=make_context(
+            build_root,
+            "out-projection",
+        ),
+    )
+
+    out_projection.compile()
+
+    out_fn = out_projection.get_callable()
+
+    projected = run_projection(
+        out_fn,
+        context,
+        weights["encoder_attn.out_proj.weight"],
+        weights["encoder_attn.out_proj.bias"],
+        logical_rows,
+    )
+
+    del out_fn
+    del out_projection
+    gc.collect()
+
+    return (
+        x + projected,
+        kh,
+        vh,
+    )
+
+
+def run_block_with_cache(
+    block,
+    x,
+    encoder,
+    checkpoint,
+    build_root,
+):
+    weights = load_decoder_block_weights(
+        checkpoint,
+        block,
+    )
+
+    (
+        x,
+        self_k,
+        self_v,
+    ) = run_self_attention_with_cache(
+        x=x,
+        weights=weights,
+        build_root=(build_root / "self-attention"),
+    )
+
+    (
+        x,
+        cross_k,
+        cross_v,
+    ) = run_cross_attention_with_cache(
+        x=x,
+        encoder=encoder,
+        weights=weights,
+        build_root=(build_root / "cross-attention"),
+    )
+
+    x = run_decoder_mlp(
+        x=x,
+        weights=weights,
+        build_root=(build_root / "mlp"),
+    )
+
+    del weights
+    gc.collect()
+
+    return (
+        x,
+        self_k,
+        self_v,
+        cross_k,
+        cross_v,
+    )
+
+
+def make_projection(
+    build_root: Path,
+    name: str,
+    k: int,
+    n: int,
+):
+    gemm = GEMM(
+        M=DECODER_PHYSICAL_SEQ,
+        K=k,
+        N=n,
+        num_aie_columns=1,
+        tile_m=16,
+        tile_k=64,
+        tile_n=64,
+        prio_accuracy=True,
+        emulate_bf16_mmul_with_bfp16=False,
+        context=make_context(
+            build_root,
+            name,
+        ),
+    )
+
+    gemm.compile()
+
+    return gemm
+
+
+def run_incremental_self_attention(
+    x,
+    self_k,
+    self_v,
+    weights,
+    build_root,
+):
+    x_norm = run_layernorm(
+        x=x,
+        weight=weights["self_attn_layer_norm.weight"],
+        bias=weights["self_attn_layer_norm.bias"],
+        build_root=(build_root / "ln"),
+    )
+
+    projection = make_projection(
+        build_root,
+        "projection",
+        STATE,
+        STATE,
+    )
+
+    fn = projection.get_callable()
+
+    q = run_projection(
+        fn,
+        x_norm,
+        weights["self_attn.q_proj.weight"],
+        weights["self_attn.q_proj.bias"],
+        1,
+    )
+
+    k = run_projection(
+        fn,
+        x_norm,
+        weights["self_attn.k_proj.weight"],
+        None,
+        1,
+    )
+
+    v = run_projection(
+        fn,
+        x_norm,
+        weights["self_attn.v_proj.weight"],
+        weights["self_attn.v_proj.bias"],
+        1,
+    )
+
+    del fn
+    del projection
+    gc.collect()
+
+    qh = (
+        q.view(
+            1,
+            HEADS,
+            HEAD_DIM,
+        )
+        .transpose(0, 1)
+        .contiguous()
+        * SCALE
+    )
+
+    kh = (
+        k.view(
+            1,
+            HEADS,
+            HEAD_DIM,
+        )
+        .transpose(0, 1)
+        .contiguous()
+    )
+
+    vh = (
+        v.view(
+            1,
+            HEADS,
+            HEAD_DIM,
+        )
+        .transpose(0, 1)
+        .contiguous()
+    )
+
+    updated_k = torch.cat(
+        [self_k, kh],
+        dim=1,
+    )
+
+    updated_v = torch.cat(
+        [self_v, vh],
+        dim=1,
+    )
+
+    scores = torch.matmul(
+        qh,
+        updated_k.transpose(1, 2),
+    )
+
+    probs = torch.softmax(
+        scores,
+        dim=-1,
+        dtype=torch.float32,
+    )
+
+    context = (
+        torch.matmul(
+            probs,
+            updated_v,
+        )
+        .transpose(0, 1)
+        .contiguous()
+        .view(1, STATE)
+    )
+
+    out_projection = make_projection(
+        build_root,
+        "out-projection",
+        STATE,
+        STATE,
+    )
+
+    out_fn = out_projection.get_callable()
+
+    projected = run_projection(
+        out_fn,
+        context,
+        weights["self_attn.out_proj.weight"],
+        weights["self_attn.out_proj.bias"],
+        1,
+    )
+
+    del out_fn
+    del out_projection
+    gc.collect()
+
+    return (
+        x + projected,
+        updated_k,
+        updated_v,
+    )
+
+
+def run_incremental_cross_attention(
+    x,
+    cross_k,
+    cross_v,
+    weights,
+    build_root,
+):
+    x_norm = run_layernorm(
+        x=x,
+        weight=weights["encoder_attn_layer_norm.weight"],
+        bias=weights["encoder_attn_layer_norm.bias"],
+        build_root=(build_root / "ln"),
+    )
+
+    projection = make_projection(
+        build_root,
+        "q-projection",
+        STATE,
+        STATE,
+    )
+
+    fn = projection.get_callable()
+
+    q = run_projection(
+        fn,
+        x_norm,
+        weights["encoder_attn.q_proj.weight"],
+        weights["encoder_attn.q_proj.bias"],
+        1,
+    )
+
+    del fn
+    del projection
+    gc.collect()
+
+    qh = (
+        q.view(
+            1,
+            HEADS,
+            HEAD_DIM,
+        )
+        .transpose(0, 1)
+        .contiguous()
+        * SCALE
+    )
+
+    scores = torch.matmul(
+        qh,
+        cross_k.transpose(1, 2),
+    )
+
+    probs = torch.softmax(
+        scores,
+        dim=-1,
+        dtype=torch.float32,
+    )
+
+    context = (
+        torch.matmul(
+            probs,
+            cross_v,
+        )
+        .transpose(0, 1)
+        .contiguous()
+        .view(1, STATE)
+    )
+
+    out_projection = make_projection(
+        build_root,
+        "out-projection",
+        STATE,
+        STATE,
+    )
+
+    out_fn = out_projection.get_callable()
+
+    projected = run_projection(
+        out_fn,
+        context,
+        weights["encoder_attn.out_proj.weight"],
+        weights["encoder_attn.out_proj.bias"],
+        1,
+    )
+
+    del out_fn
+    del out_projection
+    gc.collect()
+
+    return x + projected
+
+
+def run_incremental_mlp(
+    x,
+    weights,
+    build_root,
+):
+    x_norm = run_layernorm(
+        x=x,
+        weight=weights["final_layer_norm.weight"],
+        bias=weights["final_layer_norm.bias"],
+        build_root=(build_root / "ln"),
+    )
+
+    mlp_dim = weights["fc1.weight"].shape[0]
+
+    fc1_gemm = make_projection(
+        build_root,
+        "fc1",
+        STATE,
+        mlp_dim,
+    )
+
+    fc1_fn = fc1_gemm.get_callable()
+
+    fc1 = run_projection(
+        fc1_fn,
+        x_norm,
+        weights["fc1.weight"],
+        weights["fc1.bias"],
+        1,
+    )
+
+    del fc1_fn
+    del fc1_gemm
+    gc.collect()
+
+    gelu = F.gelu(fc1)
+
+    fc2_gemm = make_projection(
+        build_root,
+        "fc2",
+        mlp_dim,
+        STATE,
+    )
+
+    fc2_fn = fc2_gemm.get_callable()
+
+    fc2 = run_projection(
+        fc2_fn,
+        gelu,
+        weights["fc2.weight"],
+        weights["fc2.bias"],
+        1,
+    )
+
+    del fc2_fn
+    del fc2_gemm
+    gc.collect()
+
+    return x + fc2
+
+
+def run_incremental_decoder_block(
+    block,
+    x,
+    self_k,
+    self_v,
+    cross_k,
+    cross_v,
+    checkpoint,
+    build_root,
+):
+    weights = load_decoder_block_weights(
+        checkpoint,
+        block,
+    )
+
+    x, updated_k, updated_v = run_incremental_self_attention(
+        x=x,
+        self_k=self_k,
+        self_v=self_v,
+        weights=weights,
+        build_root=(build_root / "self-attention"),
+    )
+
+    x = run_incremental_cross_attention(
+        x=x,
+        cross_k=cross_k,
+        cross_v=cross_v,
+        weights=weights,
+        build_root=(build_root / "cross-attention"),
+    )
+
+    x = run_incremental_mlp(
+        x=x,
+        weights=weights,
+        build_root=(build_root / "mlp"),
+    )
+
+    del weights
+    gc.collect()
+
+    return (
+        x,
+        updated_k,
+        updated_v,
+    )
+
+
+def run_decoder_prefill(
+    x: torch.Tensor,
+    encoder: torch.Tensor,
+    checkpoint: Path,
+    build_root: Path,
+) -> tuple[
+    torch.Tensor,
+    dict[int, dict[str, torch.Tensor]],
+]:
+    """Run all decoder blocks and create their K/V caches."""
+
+    if x.ndim != 2 or x.shape[1] != STATE:
+        raise ValueError("Unexpected decoder prefill shape: " f"{tuple(x.shape)}")
+
+    if not 1 <= x.shape[0] <= DECODER_PHYSICAL_SEQ:
+        raise ValueError("Unsupported decoder prefill length: " f"{x.shape[0]}")
+
+    if encoder.shape != (
+        ENCODER_SEQ,
+        STATE,
+    ):
+        raise ValueError("Unexpected encoder shape: " f"{tuple(encoder.shape)}")
+
+    caches = {}
+
+    for block in range(BLOCKS):
+        (
+            x,
+            self_k,
+            self_v,
+            cross_k,
+            cross_v,
+        ) = run_block_with_cache(
+            block=block,
+            x=x,
+            encoder=encoder,
+            checkpoint=checkpoint,
+            build_root=(build_root / f"block{block}"),
+        )
+
+        caches[block] = {
+            "self_k": self_k,
+            "self_v": self_v,
+            "cross_k": cross_k,
+            "cross_v": cross_v,
+        }
+
+    return x, caches
+
+
+def run_decoder_incremental(
+    x: torch.Tensor,
+    caches: dict[
+        int,
+        dict[str, torch.Tensor],
+    ],
+    checkpoint: Path,
+    build_root: Path,
+) -> tuple[
+    torch.Tensor,
+    dict[int, dict[str, torch.Tensor]],
+]:
+    """Run one cached autoregressive decoder step."""
+
+    if x.shape != (
+        1,
+        STATE,
+    ):
+        raise ValueError(
+            "Incremental decoder expects " "one token, got " f"{tuple(x.shape)}"
+        )
+
+    expected_blocks = set(range(BLOCKS))
+
+    if set(caches) != expected_blocks:
+        raise ValueError("Decoder cache blocks do not " "match model blocks")
+
+    updated_caches = {}
+
+    for block in range(BLOCKS):
+        cache = caches[block]
+
+        required = {
+            "self_k",
+            "self_v",
+            "cross_k",
+            "cross_v",
+        }
+
+        missing = required - set(cache)
+
+        if missing:
+            raise KeyError(f"Block {block} cache missing: " f"{sorted(missing)}")
+
+        (
+            x,
+            updated_k,
+            updated_v,
+        ) = run_incremental_decoder_block(
+            block=block,
+            x=x,
+            self_k=cache["self_k"],
+            self_v=cache["self_v"],
+            cross_k=cache["cross_k"],
+            cross_v=cache["cross_v"],
+            checkpoint=checkpoint,
+            build_root=(build_root / f"block{block}"),
+        )
+
+        updated_caches[block] = {
+            "self_k": updated_k,
+            "self_v": updated_v,
+            "cross_k": cache["cross_k"],
+            "cross_v": cache["cross_v"],
+        }
+
+    return x, updated_caches
+
+
 def load_decoder_final_layernorm(
     checkpoint: Path,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -868,6 +1804,69 @@ def load_decoder_embedding(
         )
 
     return embedding
+
+
+def load_decoder_position_embedding(
+    checkpoint: Path,
+) -> torch.Tensor:
+    """Load the Whisper decoder positional embedding table."""
+
+    with safe_open(
+        checkpoint,
+        framework="pt",
+        device="cpu",
+    ) as handle:
+        embedding = (
+            handle.get_tensor("model.decoder.embed_positions.weight").float().clone()
+        )
+
+    return embedding
+
+
+def run_decoder_embedding(
+    token_ids: torch.Tensor,
+    position_offset: int,
+    checkpoint: Path,
+) -> torch.Tensor:
+    """Construct Whisper decoder input embeddings."""
+
+    if token_ids.ndim != 1:
+        raise ValueError(
+            "Decoder token IDs must be rank 1, got " f"{tuple(token_ids.shape)}"
+        )
+
+    if token_ids.numel() == 0:
+        raise ValueError("Decoder token IDs cannot be empty")
+
+    if position_offset < 0:
+        raise ValueError("Decoder position offset cannot be negative")
+
+    token_embedding = load_decoder_embedding(checkpoint)
+
+    position_embedding = load_decoder_position_embedding(checkpoint)
+
+    end_position = position_offset + token_ids.shape[0]
+
+    if end_position > position_embedding.shape[0]:
+        raise ValueError(
+            "Decoder positions exceed positional "
+            "embedding table: "
+            f"{position_offset}:{end_position} "
+            f"of {position_embedding.shape[0]}"
+        )
+
+    if token_ids.min().item() < 0 or token_ids.max().item() >= token_embedding.shape[0]:
+        raise ValueError("Decoder token ID outside vocabulary")
+
+    output = (
+        token_embedding[token_ids.long()]
+        + position_embedding[position_offset:end_position]
+    )
+
+    del position_embedding
+    del token_embedding
+
+    return output
 
 
 def run_vocabulary_projection(
