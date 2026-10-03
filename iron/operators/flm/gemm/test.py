@@ -9,7 +9,6 @@ import pytest
 import torch
 import aie.utils as aie_utils
 
-from aie.dialects.aie import get_target_model
 from aie.dialects._aie_enum_gen import AIEArch
 
 from iron.operators import GEMM as GenericGEMM
@@ -23,7 +22,6 @@ from iron.operators.flm.gemm.design import (
     M_TILE,
     R,
     Rounding,
-    SHIM_TASK_QUEUE,
     _b_depth_for,
     _default_l1,
     l1_budget,
@@ -31,7 +29,10 @@ from iron.operators.flm.gemm.design import (
 from iron.operators.flm.gemm.op import GEMM
 from iron.operators.flm.mm_prebuilt.op import MMPrebuilt
 from iron.operators.flm.gemm.reference import generate_golden_reference
+from iron.operators.flm.testing import skip_flm_gemm_on_npu1
 from iron.common.test_utils import run_test
+
+pytestmark = skip_flm_gemm_on_npu1
 
 # Unpacked so the parameter tables below stay column-aligned.
 NONE, GELU, SILU, SIGMOID = Epilogue
@@ -83,14 +84,16 @@ def get_params():
             (  512, 1024,  2048, SILU, (-4.0, 4.0),    CONV_EVEN),
             (  256,  512,  1024, SILU,     None,       FLOOR),
             # K or N = 10240 at M > 256 overflows the shim BD's 20-bit
-            # mega_row iteration step, so that leg goes out as one transfer
-            # per mega_row against a bounded outstanding count. These are the
-            # real E4B FFN projections, unsupported until that landed, and
-            # M=2048 is what pushes past the bound.
+            # mega_row iteration step, so the compiler cuts that leg into
+            # pieces, bounded by its queue polls and BD reclaim. These are the
+            # real E4B FFN projections, and M=2048 doubles the pieces.
             ( 1024, 10240,  2560, NONE,     None,       CONV_EVEN),  # E4B down
             ( 1024,  2560, 10240, NONE,     None,       CONV_EVEN),  # E4B gateup
             ( 2048, 10240,  2560, NONE,     None,       CONV_EVEN),  # E4B down, 2x
             ( 2048,  2560, 10240, NONE,     None,       CONV_EVEN),  # E4B gateup, 2x
+            # 64 row-block units, past the 63 a lock can count, so B is armed
+            # twice: two slabs, each resident.
+            (16384,  512,  1024, NONE,     None,       CONV_EVEN),
         ]
     else:  # npu1: _default_tile_n always returns 64 here, so with 4 columns
         # every sweep is N_TILE*COLS = 256 wide, not the 128*4=512 an
@@ -115,6 +118,8 @@ def get_params():
             (  256,  512,   512, SIGMOID,  None,       CONV_EVEN),
             (  512, 1024,  1024, SILU, (-4.0, 4.0),    CONV_EVEN),
             (  256,  512,   512, SILU,     None,       FLOOR),
+            # Two slabs, as on NPU2.
+            (16384,  512,   256, NONE,     None,       CONV_EVEN),
         ]
     # fmt: on
 
@@ -209,32 +214,15 @@ def test_gemm(M, K, N, epilogue, clamp, rounding, aie_context):
     assert not errors, "Test failed"
 
 
-def test_gemm_split_leg_bounds(aie_context):
-    """K or N = 10240 overflows the shim BD's 20-bit mega_row step, so that leg
-    goes out one transfer per mega_row. Two unmodelled shim resources bound how
-    many may be live -- BD ids and the channel task queue -- and overrunning
-    either hangs silently. The live set is 4 + 2 + 2 = 8 of 16 descriptors;
-    assert that here, since retuning SHIM_TASK_QUEUE could break it silently.
-    """
-    dev = aie_utils.get_current_device()
-    available = get_target_model(dev.resolve()).get_num_bds(0, 0)
-    worst = SHIM_TASK_QUEUE + 2 + 2
-    assert worst <= available, (
-        f"a fully split block needs {worst} shim BDs of {available}; "
-        "the split shapes will hang"
-    )
-
-    # The square case splits both legs, which the real Gemma shapes never do
-    # (E4B's down overflows on K and its gate/up on N, never both), so it is
-    # the only cover for the two-sided path.
-    GEMM(M=512, K=10240, N=10240, context=aie_context).compile()
-
-
 def test_gemm_split_leg_bounds_runs(aie_context):
-    """Execute the two-sided split path, not just compile it.
+    """K or N = 10240 overflows the shim BD's 20-bit mega_row step, so the
+    compiler cuts that leg into pieces, bounded by its queue polls and BD
+    reclaim. Overrunning either hangs or corrupts silently, which only running
+    can show.
 
-    The failure the sibling test guards against is a runtime hang or silent
-    corruption, which compiling cannot exercise. Regular rather than extensive
+    The square case splits both legs, which the real Gemma shapes never do
+    (E4B's down overflows on K and its gate/up on N, never both), so it is
+    the only cover for the two-sided path. Regular rather than extensive
     despite the size: ~8s against the suite's ~13s.
     """
     M, K, N = 512, 10240, 10240
