@@ -292,22 +292,50 @@ def load_decoder_block_weights(
         }
 
 
+def pack_incremental_block_weights(
+    weights: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Prepack immutable incremental projection weights."""
+
+    keys = (
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+        "self_attn.out_proj.weight",
+        "encoder_attn.q_proj.weight",
+        "encoder_attn.out_proj.weight",
+        "fc1.weight",
+        "fc2.weight",
+    )
+
+    return {
+        key: (weights[key].transpose(0, 1).contiguous().to(torch.bfloat16).contiguous())
+        for key in keys
+    }
+
+
 def run_projection(
     fn,
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor | None,
     logical_rows: int,
+    packed_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run a decoder projection with physical row padding."""
+
+    if packed_weight is None:
+        gemm_weight = weight.transpose(
+            0,
+            1,
+        ).contiguous()
+    else:
+        gemm_weight = packed_weight
 
     physical = run_gemm(
         fn,
         pad_rows(x),
-        weight.transpose(
-            0,
-            1,
-        ).contiguous(),
+        gemm_weight,
         (
             DECODER_PHYSICAL_SEQ,
             weight.shape[0],
@@ -1389,6 +1417,7 @@ def run_incremental_self_attention(
     self_projection=None,
     layernorm=None,
     kernels=None,
+    packed_weights=None,
 ):
     if kernels is not None:
         layernorm = kernels.layernorm
@@ -1428,6 +1457,11 @@ def run_incremental_self_attention(
         weights["self_attn.q_proj.weight"],
         weights["self_attn.q_proj.bias"],
         1,
+        packed_weight=(
+            None
+            if packed_weights is None
+            else packed_weights["self_attn.q_proj.weight"]
+        ),
     )
 
     k = run_projection(
@@ -1436,6 +1470,11 @@ def run_incremental_self_attention(
         weights["self_attn.k_proj.weight"],
         None,
         1,
+        packed_weight=(
+            None
+            if packed_weights is None
+            else packed_weights["self_attn.k_proj.weight"]
+        ),
     )
 
     v = run_projection(
@@ -1444,6 +1483,11 @@ def run_incremental_self_attention(
         weights["self_attn.v_proj.weight"],
         weights["self_attn.v_proj.bias"],
         1,
+        packed_weight=(
+            None
+            if packed_weights is None
+            else packed_weights["self_attn.v_proj.weight"]
+        ),
     )
 
     if projection is not None:
@@ -1533,6 +1577,11 @@ def run_incremental_self_attention(
         weights["self_attn.out_proj.weight"],
         weights["self_attn.out_proj.bias"],
         1,
+        packed_weight=(
+            None
+            if packed_weights is None
+            else packed_weights["self_attn.out_proj.weight"]
+        ),
     )
 
     if out_projection is not None:
@@ -1554,6 +1603,7 @@ def run_incremental_cross_attention(
     weights,
     build_root,
     kernels=None,
+    packed_weights=None,
 ):
     x_norm = run_layernorm(
         x=x,
@@ -1583,6 +1633,11 @@ def run_incremental_cross_attention(
         weights["encoder_attn.q_proj.weight"],
         weights["encoder_attn.q_proj.bias"],
         1,
+        packed_weight=(
+            None
+            if packed_weights is None
+            else packed_weights["encoder_attn.q_proj.weight"]
+        ),
     )
 
     if projection is not None:
@@ -1642,6 +1697,11 @@ def run_incremental_cross_attention(
         weights["encoder_attn.out_proj.weight"],
         weights["encoder_attn.out_proj.bias"],
         1,
+        packed_weight=(
+            None
+            if packed_weights is None
+            else packed_weights["encoder_attn.out_proj.weight"]
+        ),
     )
 
     if out_projection is not None:
@@ -1657,6 +1717,7 @@ def run_incremental_mlp(
     weights,
     build_root,
     kernels=None,
+    packed_weights=None,
 ):
     x_norm = run_layernorm(
         x=x,
@@ -1688,6 +1749,9 @@ def run_incremental_mlp(
         weights["fc1.weight"],
         weights["fc1.bias"],
         1,
+        packed_weight=(
+            None if packed_weights is None else packed_weights["fc1.weight"]
+        ),
     )
 
     if fc1_gemm is not None:
@@ -1717,6 +1781,9 @@ def run_incremental_mlp(
         weights["fc2.weight"],
         weights["fc2.bias"],
         1,
+        packed_weight=(
+            None if packed_weights is None else packed_weights["fc2.weight"]
+        ),
     )
 
     if fc2_gemm is not None:
@@ -1738,6 +1805,7 @@ def run_incremental_decoder_block(
     build_root,
     kernels=None,
     weights=None,
+    packed_weights=None,
 ):
     if weights is None:
         weights = load_decoder_block_weights(
@@ -1752,6 +1820,7 @@ def run_incremental_decoder_block(
         weights=weights,
         build_root=(build_root / "self-attention"),
         kernels=kernels,
+        packed_weights=packed_weights,
     )
 
     x = run_incremental_cross_attention(
@@ -1761,6 +1830,7 @@ def run_incremental_decoder_block(
         weights=weights,
         build_root=(build_root / "cross-attention"),
         kernels=kernels,
+        packed_weights=packed_weights,
     )
 
     x = run_incremental_mlp(
@@ -1768,6 +1838,7 @@ def run_incremental_decoder_block(
         weights=weights,
         build_root=(build_root / "mlp"),
         kernels=kernels,
+        packed_weights=packed_weights,
     )
 
     return (
@@ -1837,6 +1908,7 @@ def run_decoder_incremental(
     build_root: Path,
     kernels=None,
     block_weights=None,
+    packed_block_weights=None,
 ) -> tuple[
     torch.Tensor,
     dict[int, dict[str, torch.Tensor]],
@@ -1858,6 +1930,9 @@ def run_decoder_incremental(
 
     if block_weights is not None and len(block_weights) != BLOCKS:
         raise ValueError("Preloaded decoder block weights " "do not match model blocks")
+
+    if packed_block_weights is not None and len(packed_block_weights) != BLOCKS:
+        raise ValueError("Prepacked decoder block weights " "do not match model blocks")
 
     updated_caches = {}
 
@@ -1891,6 +1966,9 @@ def run_decoder_incremental(
             build_root=(build_root / f"block{block}"),
             kernels=kernels,
             weights=(None if block_weights is None else block_weights[block]),
+            packed_weights=(
+                None if packed_block_weights is None else packed_block_weights[block]
+            ),
         )
 
         updated_caches[block] = {
