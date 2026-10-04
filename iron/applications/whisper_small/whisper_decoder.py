@@ -78,11 +78,35 @@ def run_gemm(
     return result
 
 
+class IncrementalLayerNorm:
+    """Persistent bare LayerNorm operator for one decoder row."""
+
+    def __init__(
+        self,
+        build_root: Path,
+    ):
+        self.operator = LayerNorm(
+            size=STATE,
+            num_aie_columns=1,
+            num_channels=1,
+            tile_size=STATE,
+            context=make_context(
+                build_root,
+                "layernorm",
+            ),
+        )
+
+        self.operator.compile()
+
+        self.fn = self.operator.get_callable()
+
+
 def run_layernorm(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor,
     build_root: Path,
+    persistent=None,
 ) -> torch.Tensor:
     """Run bare LayerNorm on Phoenix and apply affine parameters."""
 
@@ -94,19 +118,30 @@ def run_layernorm(
     ):
         raise ValueError(f"Unexpected LayerNorm input shape: " f"{tuple(x.shape)}")
 
-    ln = LayerNorm(
-        size=rows * STATE,
-        num_aie_columns=1,
-        num_channels=1,
-        tile_size=STATE,
-        context=make_context(
-            build_root,
-            "layernorm",
-        ),
-    )
+    ln = None
 
-    ln.compile()
-    fn = ln.get_callable()
+    if persistent is None:
+        ln = LayerNorm(
+            size=rows * STATE,
+            num_aie_columns=1,
+            num_channels=1,
+            tile_size=STATE,
+            context=make_context(
+                build_root,
+                "layernorm",
+            ),
+        )
+
+        ln.compile()
+        fn = ln.get_callable()
+
+    else:
+        if rows != 1:
+            raise ValueError(
+                "Persistent incremental LayerNorm " "requires exactly one row"
+            )
+
+        fn = persistent.fn
 
     tensor_class = aie_utils.DEFAULT_TENSOR_CLASS
 
@@ -139,10 +174,11 @@ def run_layernorm(
 
     del output_npu
     del x_npu
-    del fn
-    del ln
 
-    gc.collect()
+    if ln is not None:
+        del fn
+        del ln
+        gc.collect()
 
     return output
 
@@ -1289,28 +1325,102 @@ def make_projection(
     return gemm
 
 
+class IncrementalDecoderKernels:
+    """Persistent geometry-based kernels for incremental decoding."""
+
+    def __init__(
+        self,
+        build_root: Path,
+        mlp_dim: int,
+    ):
+        self.layernorm = IncrementalLayerNorm(build_root / "layernorm")
+
+        self.projection_768_768 = make_projection(
+            build_root,
+            "gemm-768-768",
+            STATE,
+            STATE,
+        )
+
+        self.projection_768_768_fn = self.projection_768_768.get_callable()
+
+        self.projection_768_mlp = make_projection(
+            build_root,
+            "gemm-768-mlp",
+            STATE,
+            mlp_dim,
+        )
+
+        self.projection_768_mlp_fn = self.projection_768_mlp.get_callable()
+
+        self.projection_mlp_768 = make_projection(
+            build_root,
+            "gemm-mlp-768",
+            mlp_dim,
+            STATE,
+        )
+
+        self.projection_mlp_768_fn = self.projection_mlp_768.get_callable()
+
+
+class IncrementalSelfProjection:
+    """Persistent Q/K/V projection for incremental self-attention."""
+
+    def __init__(
+        self,
+        build_root: Path,
+    ):
+        self.projection = make_projection(
+            build_root,
+            "projection",
+            STATE,
+            STATE,
+        )
+
+        self.fn = self.projection.get_callable()
+
+
 def run_incremental_self_attention(
     x,
     self_k,
     self_v,
     weights,
     build_root,
+    self_projection=None,
+    layernorm=None,
+    kernels=None,
 ):
+    if kernels is not None:
+        layernorm = kernels.layernorm
+
+    if kernels is not None:
+        projection_fn = kernels.projection_768_768_fn
+    elif self_projection is not None:
+        projection_fn = self_projection.fn
+    else:
+        projection_fn = None
+
     x_norm = run_layernorm(
         x=x,
         weight=weights["self_attn_layer_norm.weight"],
         bias=weights["self_attn_layer_norm.bias"],
         build_root=(build_root / "ln"),
+        persistent=layernorm,
     )
 
-    projection = make_projection(
-        build_root,
-        "projection",
-        STATE,
-        STATE,
-    )
+    projection = None
 
-    fn = projection.get_callable()
+    if projection_fn is None:
+        projection = make_projection(
+            build_root,
+            "projection",
+            STATE,
+            STATE,
+        )
+
+        fn = projection.get_callable()
+    else:
+        fn = projection_fn
 
     q = run_projection(
         fn,
@@ -1336,9 +1446,10 @@ def run_incremental_self_attention(
         1,
     )
 
-    del fn
-    del projection
-    gc.collect()
+    if projection is not None:
+        del fn
+        del projection
+        gc.collect()
 
     qh = (
         q.view(
@@ -1402,14 +1513,19 @@ def run_incremental_self_attention(
         .view(1, STATE)
     )
 
-    out_projection = make_projection(
-        build_root,
-        "out-projection",
-        STATE,
-        STATE,
-    )
+    out_projection = None
 
-    out_fn = out_projection.get_callable()
+    if kernels is None:
+        out_projection = make_projection(
+            build_root,
+            "out-projection",
+            STATE,
+            STATE,
+        )
+
+        out_fn = out_projection.get_callable()
+    else:
+        out_fn = kernels.projection_768_768_fn
 
     projected = run_projection(
         out_fn,
@@ -1419,9 +1535,10 @@ def run_incremental_self_attention(
         1,
     )
 
-    del out_fn
-    del out_projection
-    gc.collect()
+    if out_projection is not None:
+        del out_fn
+        del out_projection
+        gc.collect()
 
     return (
         x + projected,
@@ -1436,22 +1553,29 @@ def run_incremental_cross_attention(
     cross_v,
     weights,
     build_root,
+    kernels=None,
 ):
     x_norm = run_layernorm(
         x=x,
         weight=weights["encoder_attn_layer_norm.weight"],
         bias=weights["encoder_attn_layer_norm.bias"],
         build_root=(build_root / "ln"),
+        persistent=(None if kernels is None else kernels.layernorm),
     )
 
-    projection = make_projection(
-        build_root,
-        "q-projection",
-        STATE,
-        STATE,
-    )
+    projection = None
 
-    fn = projection.get_callable()
+    if kernels is None:
+        projection = make_projection(
+            build_root,
+            "q-projection",
+            STATE,
+            STATE,
+        )
+
+        fn = projection.get_callable()
+    else:
+        fn = kernels.projection_768_768_fn
 
     q = run_projection(
         fn,
@@ -1461,9 +1585,10 @@ def run_incremental_cross_attention(
         1,
     )
 
-    del fn
-    del projection
-    gc.collect()
+    if projection is not None:
+        del fn
+        del projection
+        gc.collect()
 
     qh = (
         q.view(
@@ -1497,14 +1622,19 @@ def run_incremental_cross_attention(
         .view(1, STATE)
     )
 
-    out_projection = make_projection(
-        build_root,
-        "out-projection",
-        STATE,
-        STATE,
-    )
+    out_projection = None
 
-    out_fn = out_projection.get_callable()
+    if kernels is None:
+        out_projection = make_projection(
+            build_root,
+            "out-projection",
+            STATE,
+            STATE,
+        )
+
+        out_fn = out_projection.get_callable()
+    else:
+        out_fn = kernels.projection_768_768_fn
 
     projected = run_projection(
         out_fn,
@@ -1514,9 +1644,10 @@ def run_incremental_cross_attention(
         1,
     )
 
-    del out_fn
-    del out_projection
-    gc.collect()
+    if out_projection is not None:
+        del out_fn
+        del out_projection
+        gc.collect()
 
     return x + projected
 
@@ -1525,24 +1656,31 @@ def run_incremental_mlp(
     x,
     weights,
     build_root,
+    kernels=None,
 ):
     x_norm = run_layernorm(
         x=x,
         weight=weights["final_layer_norm.weight"],
         bias=weights["final_layer_norm.bias"],
         build_root=(build_root / "ln"),
+        persistent=(None if kernels is None else kernels.layernorm),
     )
 
     mlp_dim = weights["fc1.weight"].shape[0]
 
-    fc1_gemm = make_projection(
-        build_root,
-        "fc1",
-        STATE,
-        mlp_dim,
-    )
+    fc1_gemm = None
 
-    fc1_fn = fc1_gemm.get_callable()
+    if kernels is None:
+        fc1_gemm = make_projection(
+            build_root,
+            "fc1",
+            STATE,
+            mlp_dim,
+        )
+
+        fc1_fn = fc1_gemm.get_callable()
+    else:
+        fc1_fn = kernels.projection_768_mlp_fn
 
     fc1 = run_projection(
         fc1_fn,
@@ -1552,20 +1690,26 @@ def run_incremental_mlp(
         1,
     )
 
-    del fc1_fn
-    del fc1_gemm
-    gc.collect()
+    if fc1_gemm is not None:
+        del fc1_fn
+        del fc1_gemm
+        gc.collect()
 
     gelu = F.gelu(fc1)
 
-    fc2_gemm = make_projection(
-        build_root,
-        "fc2",
-        mlp_dim,
-        STATE,
-    )
+    fc2_gemm = None
 
-    fc2_fn = fc2_gemm.get_callable()
+    if kernels is None:
+        fc2_gemm = make_projection(
+            build_root,
+            "fc2",
+            mlp_dim,
+            STATE,
+        )
+
+        fc2_fn = fc2_gemm.get_callable()
+    else:
+        fc2_fn = kernels.projection_mlp_768_fn
 
     fc2 = run_projection(
         fc2_fn,
@@ -1575,9 +1719,10 @@ def run_incremental_mlp(
         1,
     )
 
-    del fc2_fn
-    del fc2_gemm
-    gc.collect()
+    if fc2_gemm is not None:
+        del fc2_fn
+        del fc2_gemm
+        gc.collect()
 
     return x + fc2
 
@@ -1591,6 +1736,7 @@ def run_incremental_decoder_block(
     cross_v,
     checkpoint,
     build_root,
+    kernels=None,
 ):
     weights = load_decoder_block_weights(
         checkpoint,
@@ -1603,6 +1749,7 @@ def run_incremental_decoder_block(
         self_v=self_v,
         weights=weights,
         build_root=(build_root / "self-attention"),
+        kernels=kernels,
     )
 
     x = run_incremental_cross_attention(
@@ -1611,12 +1758,14 @@ def run_incremental_decoder_block(
         cross_v=cross_v,
         weights=weights,
         build_root=(build_root / "cross-attention"),
+        kernels=kernels,
     )
 
     x = run_incremental_mlp(
         x=x,
         weights=weights,
         build_root=(build_root / "mlp"),
+        kernels=kernels,
     )
 
     del weights
