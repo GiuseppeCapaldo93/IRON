@@ -1835,6 +1835,8 @@ def run_decoder_incremental(
     ],
     checkpoint: Path,
     build_root: Path,
+    kernels=None,
+    block_weights=None,
 ) -> tuple[
     torch.Tensor,
     dict[int, dict[str, torch.Tensor]],
@@ -1853,6 +1855,9 @@ def run_decoder_incremental(
 
     if set(caches) != expected_blocks:
         raise ValueError("Decoder cache blocks do not " "match model blocks")
+
+    if block_weights is not None and len(block_weights) != BLOCKS:
+        raise ValueError("Preloaded decoder block weights " "do not match model blocks")
 
     updated_caches = {}
 
@@ -1884,6 +1889,8 @@ def run_decoder_incremental(
             cross_v=cache["cross_v"],
             checkpoint=checkpoint,
             build_root=(build_root / f"block{block}"),
+            kernels=kernels,
+            weights=(None if block_weights is None else block_weights[block]),
         )
 
         updated_caches[block] = {
