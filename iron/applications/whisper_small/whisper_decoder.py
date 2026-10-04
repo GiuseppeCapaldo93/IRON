@@ -2060,6 +2060,8 @@ def run_decoder_embedding(
     token_ids: torch.Tensor,
     position_offset: int,
     checkpoint: Path,
+    token_embedding=None,
+    position_embedding=None,
 ) -> torch.Tensor:
     """Construct Whisper decoder input embeddings."""
 
@@ -2074,9 +2076,15 @@ def run_decoder_embedding(
     if position_offset < 0:
         raise ValueError("Decoder position offset cannot be negative")
 
-    token_embedding = load_decoder_embedding(checkpoint)
+    owns_token_embedding = token_embedding is None
 
-    position_embedding = load_decoder_position_embedding(checkpoint)
+    owns_position_embedding = position_embedding is None
+
+    if owns_token_embedding:
+        token_embedding = load_decoder_embedding(checkpoint)
+
+    if owns_position_embedding:
+        position_embedding = load_decoder_position_embedding(checkpoint)
 
     end_position = position_offset + token_ids.shape[0]
 
@@ -2096,8 +2104,11 @@ def run_decoder_embedding(
         + position_embedding[position_offset:end_position]
     )
 
-    del position_embedding
-    del token_embedding
+    if owns_position_embedding:
+        del position_embedding
+
+    if owns_token_embedding:
+        del token_embedding
 
     return output
 
