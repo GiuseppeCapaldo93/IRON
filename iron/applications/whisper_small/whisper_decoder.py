@@ -1737,11 +1737,13 @@ def run_incremental_decoder_block(
     checkpoint,
     build_root,
     kernels=None,
+    weights=None,
 ):
-    weights = load_decoder_block_weights(
-        checkpoint,
-        block,
-    )
+    if weights is None:
+        weights = load_decoder_block_weights(
+            checkpoint,
+            block,
+        )
 
     x, updated_k, updated_v = run_incremental_self_attention(
         x=x,
@@ -1767,9 +1769,6 @@ def run_incremental_decoder_block(
         build_root=(build_root / "mlp"),
         kernels=kernels,
     )
-
-    del weights
-    gc.collect()
 
     return (
         x,
