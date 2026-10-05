@@ -1408,6 +1408,456 @@ class IncrementalSelfProjection:
         self.fn = self.projection.get_callable()
 
 
+class IncrementalDecoderRuntime:
+    """Persistent model state and execution buffers for incremental decoding."""
+
+    PROJECTION_KEYS = (
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+        "self_attn.out_proj.weight",
+        "encoder_attn.q_proj.weight",
+        "encoder_attn.out_proj.weight",
+        "fc1.weight",
+        "fc2.weight",
+    )
+
+    def __init__(
+        self,
+        checkpoint: Path,
+        build_root: Path,
+    ):
+        tensor_class = aie_utils.DEFAULT_TENSOR_CLASS
+
+        self.block_weights = []
+        self.packed_block_weights = []
+        self.resident_weights = []
+
+        for block in range(BLOCKS):
+            weights = load_decoder_block_weights(
+                checkpoint,
+                block,
+            )
+
+            packed = pack_incremental_block_weights(weights)
+
+            resident = {
+                key: tensor_class.from_torch(packed[key])
+                for key in self.PROJECTION_KEYS
+            }
+
+            self.block_weights.append(weights)
+
+            self.packed_block_weights.append(packed)
+
+            self.resident_weights.append(resident)
+
+        self.mlp_dim = self.block_weights[0]["fc1.weight"].shape[0]
+
+        self.kernels = IncrementalDecoderKernels(
+            build_root / "kernels",
+            self.mlp_dim,
+        )
+
+        self.state_input = tensor_class(
+            (
+                DECODER_PHYSICAL_SEQ,
+                STATE,
+            ),
+            dtype=np.dtype("bfloat16"),
+        )
+
+        self.state_output = tensor_class(
+            (
+                DECODER_PHYSICAL_SEQ,
+                STATE,
+            ),
+            dtype=np.dtype("bfloat16"),
+        )
+
+        self.mlp_input = tensor_class(
+            (
+                DECODER_PHYSICAL_SEQ,
+                self.mlp_dim,
+            ),
+            dtype=np.dtype("bfloat16"),
+        )
+
+        self.mlp_output = tensor_class(
+            (
+                DECODER_PHYSICAL_SEQ,
+                self.mlp_dim,
+            ),
+            dtype=np.dtype("bfloat16"),
+        )
+
+        self.layernorm_input = tensor_class(
+            (
+                1,
+                STATE,
+            ),
+            dtype=np.dtype("bfloat16"),
+        )
+
+        self.layernorm_output = tensor_class(
+            (
+                1,
+                STATE,
+            ),
+            dtype=np.dtype("bfloat16"),
+        )
+
+    def _overwrite(
+        self,
+        target,
+        value: torch.Tensor,
+        *,
+        physical_rows: bool = False,
+    ):
+        if physical_rows:
+            value = pad_rows(value)
+
+        value = value.to(torch.bfloat16).contiguous()
+
+        source_bits = value.view(torch.uint16).numpy()
+
+        with target.overwrite() as buffer:
+            target_bits = buffer.view(np.uint16)
+
+            target_bits[...] = source_bits
+
+    def layernorm(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+    ) -> torch.Tensor:
+        self._overwrite(
+            self.layernorm_input,
+            x,
+        )
+
+        self.kernels.layernorm.fn(
+            self.layernorm_input,
+            self.layernorm_output,
+        )
+
+        bare = (
+            self.layernorm_output.to_torch()
+            .float()
+            .clone()
+            .reshape(
+                1,
+                STATE,
+            )
+        )
+
+        return bare * weight.float() + bias.float()
+
+    def projection(
+        self,
+        block: int,
+        x: torch.Tensor,
+        weight_key: str,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        weight = self.block_weights[block][weight_key]
+
+        input_dim = weight.shape[1]
+        output_dim = weight.shape[0]
+
+        if input_dim == STATE:
+            input_buffer = self.state_input
+
+            self._overwrite(
+                input_buffer,
+                x,
+                physical_rows=True,
+            )
+
+        elif input_dim == self.mlp_dim:
+            input_buffer = self.mlp_input
+
+            self._overwrite(
+                input_buffer,
+                x,
+                physical_rows=True,
+            )
+
+        else:
+            raise ValueError(
+                "Unsupported persistent projection " f"input dimension: {input_dim}"
+            )
+
+        if output_dim == STATE:
+            output_buffer = self.state_output
+
+        elif output_dim == self.mlp_dim:
+            output_buffer = self.mlp_output
+
+        else:
+            raise ValueError(
+                "Unsupported persistent projection " f"output dimension: {output_dim}"
+            )
+
+        if input_dim == STATE and output_dim == STATE:
+            fn = self.kernels.projection_768_768_fn
+
+        elif input_dim == STATE and output_dim == self.mlp_dim:
+            fn = self.kernels.projection_768_mlp_fn
+
+        elif input_dim == self.mlp_dim and output_dim == STATE:
+            fn = self.kernels.projection_mlp_768_fn
+
+        else:
+            raise ValueError(
+                "Unsupported persistent projection "
+                f"geometry: {input_dim}->{output_dim}"
+            )
+
+        fn(
+            input_buffer,
+            self.resident_weights[block][weight_key],
+            output_buffer,
+        )
+
+        output = output_buffer.to_torch().float().clone()[:1].clone()
+
+        if bias is not None:
+            output += bias
+
+        return output
+
+    def run_block(
+        self,
+        block: int,
+        x: torch.Tensor,
+        self_k: torch.Tensor,
+        self_v: torch.Tensor,
+        cross_k: torch.Tensor,
+        cross_v: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Run one incremental decoder block on persistent NPU state."""
+
+        weights = self.block_weights[block]
+
+        # -------------------------------------------------
+        # Self attention.
+        # -------------------------------------------------
+
+        x_norm = self.layernorm(
+            x=x,
+            weight=weights["self_attn_layer_norm.weight"],
+            bias=weights["self_attn_layer_norm.bias"],
+        )
+
+        q = self.projection(
+            block=block,
+            x=x_norm,
+            weight_key="self_attn.q_proj.weight",
+            bias=weights["self_attn.q_proj.bias"],
+        )
+
+        k = self.projection(
+            block=block,
+            x=x_norm,
+            weight_key="self_attn.k_proj.weight",
+            bias=None,
+        )
+
+        v = self.projection(
+            block=block,
+            x=x_norm,
+            weight_key="self_attn.v_proj.weight",
+            bias=weights["self_attn.v_proj.bias"],
+        )
+
+        qh = (
+            q.view(
+                1,
+                HEADS,
+                HEAD_DIM,
+            )
+            .transpose(0, 1)
+            .contiguous()
+            * SCALE
+        )
+
+        kh = (
+            k.view(
+                1,
+                HEADS,
+                HEAD_DIM,
+            )
+            .transpose(0, 1)
+            .contiguous()
+        )
+
+        vh = (
+            v.view(
+                1,
+                HEADS,
+                HEAD_DIM,
+            )
+            .transpose(0, 1)
+            .contiguous()
+        )
+
+        updated_k = torch.cat(
+            [
+                self_k,
+                kh,
+            ],
+            dim=1,
+        )
+
+        updated_v = torch.cat(
+            [
+                self_v,
+                vh,
+            ],
+            dim=1,
+        )
+
+        scores = torch.matmul(
+            qh,
+            updated_k.transpose(
+                1,
+                2,
+            ),
+        )
+
+        probs = torch.softmax(
+            scores,
+            dim=-1,
+            dtype=torch.float32,
+        )
+
+        context = (
+            torch.matmul(
+                probs,
+                updated_v,
+            )
+            .transpose(0, 1)
+            .contiguous()
+            .view(
+                1,
+                STATE,
+            )
+        )
+
+        projected = self.projection(
+            block=block,
+            x=context,
+            weight_key="self_attn.out_proj.weight",
+            bias=weights["self_attn.out_proj.bias"],
+        )
+
+        x = x + projected
+
+        # -------------------------------------------------
+        # Cross attention.
+        # -------------------------------------------------
+
+        x_norm = self.layernorm(
+            x=x,
+            weight=weights["encoder_attn_layer_norm.weight"],
+            bias=weights["encoder_attn_layer_norm.bias"],
+        )
+
+        q = self.projection(
+            block=block,
+            x=x_norm,
+            weight_key="encoder_attn.q_proj.weight",
+            bias=weights["encoder_attn.q_proj.bias"],
+        )
+
+        qh = (
+            q.view(
+                1,
+                HEADS,
+                HEAD_DIM,
+            )
+            .transpose(0, 1)
+            .contiguous()
+            * SCALE
+        )
+
+        scores = torch.matmul(
+            qh,
+            cross_k.transpose(
+                1,
+                2,
+            ),
+        )
+
+        probs = torch.softmax(
+            scores,
+            dim=-1,
+            dtype=torch.float32,
+        )
+
+        context = (
+            torch.matmul(
+                probs,
+                cross_v,
+            )
+            .transpose(0, 1)
+            .contiguous()
+            .view(
+                1,
+                STATE,
+            )
+        )
+
+        projected = self.projection(
+            block=block,
+            x=context,
+            weight_key="encoder_attn.out_proj.weight",
+            bias=weights["encoder_attn.out_proj.bias"],
+        )
+
+        x = x + projected
+
+        # -------------------------------------------------
+        # MLP.
+        # -------------------------------------------------
+
+        x_norm = self.layernorm(
+            x=x,
+            weight=weights["final_layer_norm.weight"],
+            bias=weights["final_layer_norm.bias"],
+        )
+
+        fc1 = self.projection(
+            block=block,
+            x=x_norm,
+            weight_key="fc1.weight",
+            bias=weights["fc1.bias"],
+        )
+
+        gelu = F.gelu(fc1)
+
+        fc2 = self.projection(
+            block=block,
+            x=gelu,
+            weight_key="fc2.weight",
+            bias=weights["fc2.bias"],
+        )
+
+        x = x + fc2
+
+        return (
+            x,
+            updated_k,
+            updated_v,
+        )
+
+
 def run_incremental_self_attention(
     x,
     self_k,
@@ -1909,6 +2359,7 @@ def run_decoder_incremental(
     kernels=None,
     block_weights=None,
     packed_block_weights=None,
+    runtime=None,
 ) -> tuple[
     torch.Tensor,
     dict[int, dict[str, torch.Tensor]],
@@ -1951,25 +2402,41 @@ def run_decoder_incremental(
         if missing:
             raise KeyError(f"Block {block} cache missing: " f"{sorted(missing)}")
 
-        (
-            x,
-            updated_k,
-            updated_v,
-        ) = run_incremental_decoder_block(
-            block=block,
-            x=x,
-            self_k=cache["self_k"],
-            self_v=cache["self_v"],
-            cross_k=cache["cross_k"],
-            cross_v=cache["cross_v"],
-            checkpoint=checkpoint,
-            build_root=(build_root / f"block{block}"),
-            kernels=kernels,
-            weights=(None if block_weights is None else block_weights[block]),
-            packed_weights=(
-                None if packed_block_weights is None else packed_block_weights[block]
-            ),
-        )
+        if runtime is None:
+            (
+                x,
+                updated_k,
+                updated_v,
+            ) = run_incremental_decoder_block(
+                block=block,
+                x=x,
+                self_k=cache["self_k"],
+                self_v=cache["self_v"],
+                cross_k=cache["cross_k"],
+                cross_v=cache["cross_v"],
+                checkpoint=checkpoint,
+                build_root=(build_root / f"block{block}"),
+                kernels=kernels,
+                weights=(None if block_weights is None else block_weights[block]),
+                packed_weights=(
+                    None
+                    if packed_block_weights is None
+                    else packed_block_weights[block]
+                ),
+            )
+        else:
+            (
+                x,
+                updated_k,
+                updated_v,
+            ) = runtime.run_block(
+                block=block,
+                x=x,
+                self_k=cache["self_k"],
+                self_v=cache["self_v"],
+                cross_k=cache["cross_k"],
+                cross_v=cache["cross_v"],
+            )
 
         updated_caches[block] = {
             "self_k": updated_k,
