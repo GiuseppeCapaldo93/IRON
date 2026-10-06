@@ -92,6 +92,39 @@ def load_wav(path):
     return waveform
 
 
+def log_mel_spectrogram_long(waveform):
+    """Whisper log-Mel features of a whole recording for long-form decoding.
+
+    Like OpenAI Whisper's ``transcribe``, the audio is followed by 30 s of
+    silence and normalized over the whole recording. Returns
+    ``(features [1, N_MELS, frames], content_frames)``, where only the first
+    ``content_frames`` frames come from the audio itself.
+    """
+
+    waveform = waveform.to(dtype=torch.float32).flatten()
+    n_samples = int(_preprocessor_config()["n_samples"])
+    padded = torch.nn.functional.pad(waveform, (0, n_samples))
+
+    window = torch.hann_window(N_FFT, periodic=True, dtype=torch.float32)
+    stft = torch.stft(
+        padded,
+        n_fft=N_FFT,
+        hop_length=HOP_LENGTH,
+        window=window,
+        center=True,
+        return_complex=True,
+    )
+    mel = mel_filterbank() @ stft[..., :-1].abs().pow(2.0)
+    log_spec = torch.clamp(mel, min=1e-10).log10()
+    log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
+    log_spec = (log_spec + 4.0) / 4.0
+
+    if not torch.isfinite(log_spec).all():
+        raise RuntimeError("Non-finite Whisper features")
+
+    return log_spec.unsqueeze(0).contiguous(), waveform.numel() // HOP_LENGTH
+
+
 def log_mel_spectrogram(
     waveform,
     target_frames=TARGET_FRAMES,

@@ -2,24 +2,30 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""End-to-end Whisper-small transcription of one 30 s window on Phoenix/NPU1.
+"""End-to-end Whisper-small transcription on Phoenix/NPU1.
 
-Phases, each kept within the NPU1 context cache and cleaned up in between:
+Each 30 s window runs three phases, each kept within the NPU1 context cache
+and cleaned up before the next:
 
 1. frontend: conv1 / GELU / conv2 / GELU on the NPU at 3000 Mel frames.
 2. encoder: 12 blocks at 1536 physical rows (1500 logical) with four-column
    GEMMs; LayerNorm, GELU and masked softmax on the CPU. The resident 768x768
    GEMM then computes the cross-attention K/V of every decoder block.
-3. prefill: the four-token Whisper prompt.
-4. decode: one token per step with four-column NPU GEMVs and resident BF16
-   weights; LayerNorm, attention and GELU on the CPU.
+3. decoder: the prompt, then one generated token per step, with four-column
+   NPU GEMVs and resident BF16 weights; LayerNorm, attention and GELU on the
+   CPU.
 
 The vocabulary projection and the greedy token selection run on the CPU.
 
-Acceptance: the generated token ids must exactly match a CPU FP32 Hugging Face
-greedy decode of the same log-Mel features under the same suppression policy.
-The process exits non-zero on a mismatch or when no end-of-text token is
-produced.
+Audio up to 30 s is decoded as one window without timestamps. Longer audio is
+decoded window by window with timestamps, following OpenAI Whisper's
+sequential long-form algorithm (greedy, no temperature fallback, no
+conditioning on previous text).
+
+Acceptance: the generated token ids of every window must exactly match a CPU
+FP32 Hugging Face greedy decode of the same log-Mel features under the same
+token selection. The process exits non-zero on a mismatch or when a window
+produces no end-of-text token.
 """
 
 import argparse
@@ -27,7 +33,6 @@ import gc
 import json
 import os
 import re
-import sys
 import time
 from pathlib import Path
 
@@ -41,7 +46,7 @@ from iron.operators.gelu.op import GELU
 from iron.operators.gemm.op import GEMM
 from iron.operators.gemv.op import GEMV
 
-from whisper_audio import load_wav, log_mel_spectrogram
+from whisper_audio import load_wav, log_mel_spectrogram, log_mel_spectrogram_long
 from whisper_common import (
     ARTIFACT_ROOT,
     BLOCKS,
@@ -54,9 +59,6 @@ from whisper_common import (
     whisper_checkpoint,
 )
 from whisper_decoder import (
-    DECODER_PHYSICAL_SEQ,
-    DecoderPrefillRuntime,
-    LayerNorm,
     load_decoder_block_weights,
     load_decoder_embedding,
     load_decoder_final_layernorm,
@@ -65,7 +67,6 @@ from whisper_decoder import (
     merge_heads,
     run_decoder_embedding,
     run_gemm,
-    run_projection,
     split_heads,
 )
 from whisper_encoder import load_block_weights
@@ -83,8 +84,19 @@ COLUMNS = 4
 
 # <|startoftranscript|> <|en|> <|transcribe|> <|notimestamps|>
 PROMPT = [50258, 50259, 50359, 50363]
+# The same prompt without <|notimestamps|>, for long-form decoding.
+TIMESTAMP_PROMPT = PROMPT[:3]
 EOS = 50257
 FIRST_NON_TEXT_SPECIAL = 50358
+# <|0.00|>; each following token adds 0.02 s, i.e. two 10 ms Mel frames.
+TIMESTAMP_BEGIN = 50364
+TIMESTAMP_SECONDS = 0.02
+HOP_SECONDS = 0.01
+INPUT_STRIDE = 2
+# The first timestamp may be at most 1.0 s.
+MAX_INITIAL_TIMESTAMP = 50
+# Accepted timestamp difference against the CPU reference, in 0.02 s steps.
+TIMESTAMP_TOLERANCE = 2
 MAX_NEW_TOKENS = 224
 
 runtime_backend = aie_utils.DefaultNPURuntime
@@ -318,130 +330,6 @@ class FullWindowEncoderRuntime:
         return caches
 
 
-def run_encoder(mel, checkpoint, build_root, timings):
-    start = time.perf_counter()
-    x = run_frontend_full(mel, checkpoint, build_root / "frontend")
-    timings["frontend"] = time.perf_counter() - start
-    frontend = x[:SEQ].clone()
-    cleanup("frontend -> encoder")
-
-    start = time.perf_counter()
-    runtime = FullWindowEncoderRuntime(build_root / "encoder")
-    check_contexts("encoder resident")
-    timings["encoder_setup"] = time.perf_counter() - start
-
-    start = time.perf_counter()
-    for block in range(BLOCKS):
-        x = runtime.block(x, load_block_weights(checkpoint, block))
-        if not torch.isfinite(x[:SEQ]).all():
-            raise RuntimeError(f"Encoder block {block} produced non-finite values")
-    with safe_open(str(checkpoint), framework="pt", device="cpu") as h:
-        ln_w = h.get_tensor("model.encoder.layer_norm.weight").float()
-        ln_b = h.get_tensor("model.encoder.layer_norm.bias").float()
-    encoder = F.layer_norm(bf16(x[:SEQ]), (STATE,), ln_w, ln_b)
-    timings["encoder"] = time.perf_counter() - start
-    return runtime, frontend, encoder
-
-
-# ============================================================================
-# Phase 3: prefill with precomputed cross-attention K/V
-# ============================================================================
-
-
-class FullWindowPrefillRuntime(DecoderPrefillRuntime):
-    """Four-token prefill; the score GEMM is widened to N=SEQ_PAD."""
-
-    def __init__(self, build_root, block_weights):
-        self.build_root = Path(build_root)
-        self.block_weights = block_weights
-        self.logical_rows = len(PROMPT)
-
-        self.layernorm = LayerNorm(
-            size=len(PROMPT) * STATE,
-            num_aie_columns=1,
-            num_channels=1,
-            tile_size=STATE,
-            context=make_context(self.build_root, "layernorm-4"),
-        )
-        self.layernorm.compile()
-        self.layernorm_fn = self.layernorm.get_callable()
-
-        def make(K, N, name):
-            P = DECODER_PHYSICAL_SEQ
-            return gemm(P, K, N, self.build_root, name, tile_m=16)
-
-        self.projection, self.projection_fn = make(STATE, STATE, "gemm-768-768")
-        self.score, self.score_fn = make(HEAD_DIM, SEQ_PAD, "score-64-1536")
-        self.fc1, self.fc1_fn = make(STATE, MLP, "gemm-768-3072")
-        self.fc2, self.fc2_fn = make(MLP, STATE, "gemm-3072-768")
-
-    def _project(self, x, weights, name, bias=True):
-        return run_projection(
-            self.projection_fn,
-            x,
-            weights[f"{name}.weight"],
-            weights[f"{name}.bias"] if bias else None,
-            self.logical_rows,
-        )
-
-    def _scores(self, qh_head, k_cols):
-        rows = self.logical_rows
-        q_pad = torch.zeros((DECODER_PHYSICAL_SEQ, HEAD_DIM))
-        q_pad[:rows] = qh_head * SCALE
-        k_pad = torch.zeros((HEAD_DIM, SEQ_PAD))
-        k_pad[:, : k_cols.shape[1]] = k_cols
-        out = run_gemm(self.score_fn, q_pad, k_pad, (DECODER_PHYSICAL_SEQ, SEQ_PAD))
-        return out[:rows, : k_cols.shape[1]]
-
-    def _attend(self, qh, kh, vh, mask=None):
-        scores = torch.stack([self._scores(qh[i], kh[i].T) for i in range(HEADS)])
-        if mask is not None:
-            scores = scores.masked_fill(mask, float("-inf"))
-        return merge_heads(torch.matmul(torch.softmax(scores, dim=-1), vh))
-
-    def self_attention(self, x, weights):
-        h = self.layer_norm(
-            x,
-            weights["self_attn_layer_norm.weight"],
-            weights["self_attn_layer_norm.bias"],
-        )
-        qh = split_heads(self._project(h, weights, "self_attn.q_proj"))
-        kh = split_heads(self._project(h, weights, "self_attn.k_proj", bias=False))
-        vh = split_heads(self._project(h, weights, "self_attn.v_proj"))
-        rows = self.logical_rows
-        mask = torch.triu(torch.ones(rows, rows, dtype=torch.bool), diagonal=1)
-        out = self._project(
-            self._attend(qh, kh, vh, mask), weights, "self_attn.out_proj"
-        )
-        return x + out, kh, vh
-
-    def cross_attention_cached(self, x, kh, vh, weights):
-        h = self.layer_norm(
-            x,
-            weights["encoder_attn_layer_norm.weight"],
-            weights["encoder_attn_layer_norm.bias"],
-        )
-        qh = split_heads(self._project(h, weights, "encoder_attn.q_proj"))
-        out = self._project(self._attend(qh, kh, vh), weights, "encoder_attn.out_proj")
-        return x + out
-
-    def run(self, x, cross):
-        caches = {}
-        for block in range(BLOCKS):
-            w = self.block_weights[block]
-            x, self_k, self_v = self.self_attention(x, w)
-            cross_k, cross_v = cross[block]
-            x = self.cross_attention_cached(x, cross_k, cross_v, w)
-            x = self.mlp(x, w)
-            caches[block] = {
-                "self_k": self_k.clone(),
-                "self_v": self_v.clone(),
-                "cross_k": cross_k,
-                "cross_v": cross_v,
-            }
-        return x, caches
-
-
 # ============================================================================
 # Phase 4: incremental decoder on four-column GEMV
 # ============================================================================
@@ -566,114 +454,301 @@ class GemvDecoderRuntime:
 
 
 # ============================================================================
-# Greedy decoding policy and CPU FP32 reference
+# Token selection
 # ============================================================================
 
 
-def apply_policy(logits, step, suppress, begin_suppress):
-    logits = logits.clone()
-    logits[suppress] = float("-inf")
-    logits[FIRST_NON_TEXT_SPECIAL:] = float("-inf")
-    if step == 0:
-        logits[begin_suppress] = float("-inf")
-    return logits
+class TokenPolicy:
+    """Whisper greedy-decoding logit filters.
+
+    Without timestamps, all special tokens are suppressed. With timestamps,
+    OpenAI Whisper's ApplyTimestampRules apply: timestamps come in pairs and
+    never decrease, the first token is a timestamp of at most 1.0 s, and a
+    timestamp is forced whenever the total timestamp probability exceeds that
+    of the most likely text token.
+    """
+
+    def __init__(self, config, timestamps):
+        self.suppress = config["suppress_tokens"]
+        self.begin_suppress = config["begin_suppress_tokens"]
+        self.timestamps = timestamps
+
+    def __call__(self, logits, generated):
+        logits = logits.float().clone()
+        logits[self.suppress] = float("-inf")
+        if not generated:
+            logits[self.begin_suppress] = float("-inf")
+        if not self.timestamps:
+            logits[FIRST_NON_TEXT_SPECIAL:] = float("-inf")
+            return logits
+
+        logits[FIRST_NON_TEXT_SPECIAL:TIMESTAMP_BEGIN] = float("-inf")
+        last = len(generated) >= 1 and generated[-1] >= TIMESTAMP_BEGIN
+        penultimate = len(generated) < 2 or generated[-2] >= TIMESTAMP_BEGIN
+        if last:
+            if penultimate:
+                logits[TIMESTAMP_BEGIN:] = float("-inf")
+            else:
+                logits[:EOS] = float("-inf")
+
+        stamps = [t for t in generated if t >= TIMESTAMP_BEGIN]
+        if stamps:
+            floor = stamps[-1] if last and not penultimate else stamps[-1] + 1
+            logits[TIMESTAMP_BEGIN:floor] = float("-inf")
+        if not generated:
+            logits[:TIMESTAMP_BEGIN] = float("-inf")
+            logits[TIMESTAMP_BEGIN + MAX_INITIAL_TIMESTAMP + 1 :] = float("-inf")
+
+        logprobs = torch.log_softmax(logits, dim=-1)
+        timestamp_logprob = torch.logsumexp(logprobs[TIMESTAMP_BEGIN:], dim=-1)
+        if timestamp_logprob > logprobs[:TIMESTAMP_BEGIN].max():
+            logits[:TIMESTAMP_BEGIN] = float("-inf")
+        return logits
 
 
-def cpu_reference(snapshot, mel, suppress, begin_suppress):
-    """Hugging Face FP32 frontend, encoder and greedy tokens for the same mel."""
+def greedy_decode(step, prompt, policy):
+    """Feed ``prompt``, then pick tokens until end-of-text or the length limit.
 
-    from transformers import WhisperForConditionalGeneration
+    ``step(token_ids)`` appends tokens to the decoder state and returns the
+    logits of the last one.
+    """
 
-    model = WhisperForConditionalGeneration.from_pretrained(
-        snapshot, local_files_only=True, dtype=torch.float32
-    ).eval()
-    encoder = model.model.encoder
-    with torch.no_grad():
+    logits = step(prompt)
+    generated = []
+    while True:
+        token = int(policy(logits, generated).argmax())
+        generated.append(token)
+        if token == EOS or len(generated) >= MAX_NEW_TOKENS:
+            return generated
+        logits = step([token])
+
+
+# ============================================================================
+# NPU and CPU backends: one 30 s window of log-Mel features -> tokens
+# ============================================================================
+
+
+class PhoenixWhisper:
+    """Phoenix/NPU1 backend; each phase releases its contexts before the next."""
+
+    def __init__(self, checkpoint, build_root):
+        self.checkpoint = checkpoint
+        self.build_root = Path(build_root)
+        self.encoder_weights = [
+            load_block_weights(checkpoint, b) for b in range(BLOCKS)
+        ]
+        self.decoder_weights = [
+            load_decoder_block_weights(checkpoint, b) for b in range(BLOCKS)
+        ]
+        with safe_open(str(checkpoint), framework="pt", device="cpu") as h:
+            self.encoder_ln = (
+                h.get_tensor("model.encoder.layer_norm.weight").float(),
+                h.get_tensor("model.encoder.layer_norm.bias").float(),
+            )
+        self.token_embedding = load_decoder_embedding(checkpoint)
+        self.position_embedding = load_decoder_position_embedding(checkpoint)
+        self.final_ln = tuple(
+            t.float() for t in load_decoder_final_layernorm(checkpoint)
+        )
+        self.timings = {}
+
+    def _time(self, key, start):
+        self.timings[key] = self.timings.get(key, 0.0) + time.perf_counter() - start
+
+    def encode(self, mel):
+        """Return frontend output, encoder output and per-block cross K/V."""
+
+        start = time.perf_counter()
+        x = run_frontend_full(mel, self.checkpoint, self.build_root / "frontend")
+        self._time("frontend", start)
+        frontend = x[:SEQ].clone()
+        cleanup("frontend -> encoder")
+
+        start = time.perf_counter()
+        runtime = FullWindowEncoderRuntime(self.build_root / "encoder")
+        check_contexts("encoder resident")
+        self._time("encoder_setup", start)
+
+        start = time.perf_counter()
+        for block in range(BLOCKS):
+            x = runtime.block(x, self.encoder_weights[block])
+            if not torch.isfinite(x[:SEQ]).all():
+                raise RuntimeError(f"Encoder block {block} produced non-finite values")
+        encoder = F.layer_norm(bf16(x[:SEQ]), (STATE,), *self.encoder_ln)
+        self._time("encoder", start)
+
+        start = time.perf_counter()
+        cross = runtime.cross_kv(pad_to(encoder, SEQ_PAD), self.decoder_weights)
+        self._time("cross_kv", start)
+        del runtime
+        cleanup("encoder -> decoder")
+        return frontend, encoder, cross
+
+    def decode(self, cross, prompt, policy):
+        start = time.perf_counter()
+        decoder = GemvDecoderRuntime(self.build_root / "decode", self.decoder_weights)
+        check_contexts("decoder resident")
+        self._time("decode_setup", start)
+
+        empty = torch.zeros((HEADS, 0, HEAD_DIM))
+        state = {
+            "position": 0,
+            "caches": {
+                block: {"self_k": empty, "self_v": empty, "cross_k": k, "cross_v": v}
+                for block, (k, v) in enumerate(cross)
+            },
+        }
+
+        def step(token_ids):
+            for token in token_ids:
+                x = run_decoder_embedding(
+                    token_ids=torch.tensor([token], dtype=torch.long),
+                    position_offset=state["position"],
+                    checkpoint=self.checkpoint,
+                    token_embedding=self.token_embedding,
+                    position_embedding=self.position_embedding,
+                )
+                raw, state["caches"] = decoder.step(x, state["caches"])
+                state["position"] += 1
+            final = F.layer_norm(raw[-1:].float(), (STATE,), *self.final_ln)
+            return torch.matmul(final, self.token_embedding.T)[0]
+
+        start = time.perf_counter()
+        tokens = greedy_decode(step, prompt, policy)
+        self._time("decode", start)
+        self.timings["decode_tokens"] = (
+            self.timings.get("decode_tokens", 0) + len(prompt) + len(tokens) - 1
+        )
+        del decoder
+        cleanup("decoder -> next")
+        return tokens
+
+    def window(self, mel, prompt, policy):
+        frontend, encoder, cross = self.encode(mel)
+        return self.decode(cross, prompt, policy), (frontend, encoder)
+
+
+class CpuWhisper:
+    """Hugging Face FP32 reference backend with the same token selection."""
+
+    def __init__(self, snapshot):
+        from transformers import WhisperForConditionalGeneration
+
+        self.model = WhisperForConditionalGeneration.from_pretrained(
+            snapshot, local_files_only=True, dtype=torch.float32
+        ).eval()
+
+    @torch.no_grad()
+    def window(self, mel, prompt, policy):
+        encoder = self.model.model.encoder
         conv = F.gelu(encoder.conv2(F.gelu(encoder.conv1(mel))))[0].T
         frontend = encoder.embed_positions.weight[:SEQ] + conv
         hidden = encoder(mel).last_hidden_state
-        ids = list(PROMPT)
-        tokens = []
-        for step in range(MAX_NEW_TOKENS):
-            logits = model(
-                encoder_outputs=(hidden,), decoder_input_ids=torch.tensor([ids])
-            ).logits[0, -1]
-            token = int(apply_policy(logits, step, suppress, begin_suppress).argmax())
-            tokens.append(token)
-            ids.append(token)
-            if token == EOS:
-                break
-    return frontend, hidden[0], tokens
+        state = {"past": None}
+
+        def step(token_ids):
+            out = self.model(
+                encoder_outputs=(hidden,),
+                decoder_input_ids=torch.tensor([token_ids]),
+                past_key_values=state["past"],
+                use_cache=True,
+            )
+            state["past"] = out.past_key_values
+            return out.logits[0, -1]
+
+        return greedy_decode(step, prompt, policy), (frontend, hidden[0])
 
 
-def transcribe(mel, checkpoint, build_root, timings):
-    """Run phases 1-4 and return (frontend, encoder, generated token ids)."""
+# ============================================================================
+# Long-form transcription
+# ============================================================================
 
-    config = json.loads((checkpoint.parent / "config.json").read_text("utf-8"))
-    suppress = config["suppress_tokens"]
-    begin_suppress = config["begin_suppress_tokens"]
 
-    runtime, frontend, encoder = run_encoder(mel, checkpoint, build_root, timings)
+def decode_window(backend, mel, seek, content_frames, policy):
+    size = min(FRAMES, content_frames - seek)
+    segment = torch.zeros((1, MELS, FRAMES))
+    segment[:, :, :size] = mel[:, :, seek : seek + size]
+    tokens, _ = backend.window(segment, TIMESTAMP_PROMPT, policy)
+    return size, tokens
 
-    start = time.perf_counter()
-    decoder_weights = [load_decoder_block_weights(checkpoint, b) for b in range(BLOCKS)]
-    cross = runtime.cross_kv(pad_to(encoder, SEQ_PAD), decoder_weights)
-    timings["cross_kv"] = time.perf_counter() - start
-    del runtime
-    cleanup("encoder -> prefill")
 
-    token_embedding = load_decoder_embedding(checkpoint)
-    position_embedding = load_decoder_position_embedding(checkpoint)
-    final_w, final_b = (t.float() for t in load_decoder_final_layernorm(checkpoint))
+def transcribe_long(backend, mel, content_frames, policy):
+    """OpenAI Whisper's sequential long-form decoding, without temperature
+    fallback or conditioning on previous text.
 
-    def embed(ids, offset):
-        return run_decoder_embedding(
-            token_ids=torch.tensor(ids, dtype=torch.long),
-            position_offset=offset,
-            checkpoint=checkpoint,
-            token_embedding=token_embedding,
-            position_embedding=position_embedding,
-        )
+    Each window is decoded with timestamps. The next window starts at the last
+    complete timestamp pair, or after the whole window when the decoder ends
+    with a single timestamp or produces none.
+    """
 
-    def next_token(raw, step):
-        final = F.layer_norm(raw[-1:].float(), (STATE,), final_w, final_b)
-        logits = torch.matmul(final, token_embedding.T)[0]
-        return int(apply_policy(logits, step, suppress, begin_suppress).argmax())
+    seek = 0
+    windows = []
+    while seek < content_frames:
+        size, tokens = decode_window(backend, mel, seek, content_frames, policy)
+        windows.append({"seek": seek, "tokens": tokens})
 
-    start = time.perf_counter()
-    prefill = FullWindowPrefillRuntime(build_root / "prefill", decoder_weights)
-    check_contexts("prefill resident")
-    timings["prefill_setup"] = time.perf_counter() - start
+        text_end = [t for t in tokens if t != EOS]
+        is_stamp = [t >= TIMESTAMP_BEGIN for t in text_end]
+        single_ending = is_stamp[-2:] == [False, True]
+        pairs = [
+            i + 1 for i in range(len(is_stamp) - 1) if is_stamp[i] and is_stamp[i + 1]
+        ]
+        advance = size
+        if pairs and not single_ending:
+            last_stamp = text_end[pairs[-1] - 1] - TIMESTAMP_BEGIN
+            advance = last_stamp * INPUT_STRIDE
+        seek += advance if advance > 0 else size
+    return windows
 
-    start = time.perf_counter()
-    raw, caches = prefill.run(embed(PROMPT, 0), cross)
-    token = next_token(raw, 0)
-    timings["prefill"] = time.perf_counter() - start
-    del prefill
-    cleanup("prefill -> decode")
 
-    start = time.perf_counter()
-    decoder = GemvDecoderRuntime(build_root / "decode", decoder_weights)
-    check_contexts("decode resident")
-    timings["decode_setup"] = time.perf_counter() - start
+def windows_match(actual, expected):
+    """Same text tokens at the same positions, and every timestamp within
+    TIMESTAMP_TOLERANCE steps.
 
-    generated = [token]
-    start = time.perf_counter()
-    while token != EOS and len(generated) < MAX_NEW_TOKENS:
-        raw, caches = decoder.step(
-            embed([token], len(PROMPT) + len(generated) - 1), caches
-        )
-        token = next_token(raw, len(generated))
-        generated.append(token)
-    timings["decode"] = time.perf_counter() - start
-    del decoder
-    cleanup("final")
-    return frontend, encoder, generated
+    Adjacent timestamps are often near-ties, so a BF16 decoder may legitimately
+    pick a neighbour of the FP32 choice; text tokens must still be identical.
+    Returns (match, largest timestamp difference in steps).
+    """
+
+    if len(actual) != len(expected):
+        return False, None
+    worst = 0
+    for a, e in zip(actual, expected):
+        if a >= TIMESTAMP_BEGIN and e >= TIMESTAMP_BEGIN:
+            worst = max(worst, abs(a - e))
+        elif a != e:
+            return False, None
+    return worst <= TIMESTAMP_TOLERANCE, worst
+
+
+def segments_of(windows, tokenizer):
+    """(start s, end s, text) for every timestamp-delimited segment."""
+
+    result = []
+    for window in windows:
+        offset = window["seek"] * HOP_SECONDS
+        start, text = None, []
+        for token in window["tokens"]:
+            if token >= TIMESTAMP_BEGIN:
+                time_s = offset + (token - TIMESTAMP_BEGIN) * TIMESTAMP_SECONDS
+                if start is None:
+                    start = time_s
+                elif text:
+                    result.append((start, time_s, tokenizer.decode(text).strip()))
+                    start, text = time_s, []
+                else:
+                    start = time_s
+            elif token < EOS:
+                text.append(token)
+        if text:
+            result.append((start or offset, None, tokenizer.decode(text).strip()))
+    return result
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Transcribe up to 30 s of 16-kHz mono PCM16 audio on Phoenix/NPU1."
+        description="Transcribe 16-kHz mono PCM16 audio with Whisper-small on "
+        "Phoenix/NPU1. Audio longer than 30 s is decoded window by window."
     )
     parser.add_argument(
         "--wav",
@@ -687,6 +762,11 @@ def main():
         default=default_build_dir(),
         help="compiled kernel directory (default: $IRON_WHISPER_BUILD_DIR or "
         "<artifact dir>/pipeline-build); keep it short on Windows",
+    )
+    parser.add_argument(
+        "--long-form",
+        action="store_true",
+        help="use timestamp-based long-form decoding even for audio up to 30 s",
     )
     parser.add_argument(
         "--reference-text",
@@ -719,61 +799,95 @@ def main():
 
     waveform = load_wav(wav)
     duration = waveform.numel() / 16000
-    if duration > 30.0:
-        print(f"WARNING: {duration:.1f} s of audio; only the first 30 s is used")
-    mel = log_mel_spectrogram(waveform, target_frames=FRAMES).float()
-    print(f"Audio: {wav} ({duration:.3f} s), mel {tuple(mel.shape)}")
+    long_form = args.long_form or duration > 30.0
+    print(
+        f"Audio: {wav} ({duration:.3f} s), {'long-form' if long_form else 'one window'}"
+    )
 
-    reference = None
-    if not args.no_reference:
-        start = time.perf_counter()
-        reference = cpu_reference(
-            snapshot,
-            mel,
-            config["suppress_tokens"],
-            config["begin_suppress_tokens"],
-        )
-        print(f"CPU FP32 reference: {time.perf_counter() - start:.3f} s")
+    npu = PhoenixWhisper(checkpoint, args.build_dir)
 
-    timings = {}
-    frontend, encoder, generated = transcribe(mel, checkpoint, args.build_dir, timings)
-    text = tokenizer.decode(generated, skip_special_tokens=True)
-    eos = generated[-1] == EOS
+    if long_form:
+        mel, content_frames = log_mel_spectrogram_long(waveform)
+        policy = TokenPolicy(config, timestamps=True)
+        windows = transcribe_long(npu, mel, content_frames, policy)
+        generated = [t for w in windows for t in w["tokens"]]
+        for start_s, end_s, text in segments_of(windows, tokenizer):
+            end = "   ?  " if end_s is None else f"{end_s:6.2f}"
+            print(f"  [{start_s:6.2f} -> {end}] {text}")
+        eos = all(w["tokens"][-1] == EOS for w in windows)
+        print(f"Windows: {len(windows)} (seek frames {[w['seek'] for w in windows]})")
+        token_match = None
+        if not args.no_reference:
+            # The reference decodes the same windows, so that a timestamp
+            # near-tie in one window does not shift every later window. It is
+            # loaded after the NPU run, which it would otherwise slow down.
+            cpu = CpuWhisper(snapshot)
+            start = time.perf_counter()
+            token_match, worst = True, 0
+            for i, window in enumerate(windows):
+                _, expected = decode_window(
+                    cpu, mel, window["seek"], content_frames, policy
+                )
+                match, diff = windows_match(window["tokens"], expected)
+                if not match:
+                    token_match = False
+                    print(f"  window {i} (seek {window['seek']}) differs")
+                    print("    NPU:", window["tokens"])
+                    print("    CPU:", expected)
+                elif diff:
+                    worst = max(worst, diff)
+            print(f"CPU FP32 reference: {time.perf_counter() - start:.3f} s")
+            if token_match:
+                print(
+                    f"Largest timestamp difference: {worst} "
+                    f"({worst * TIMESTAMP_SECONDS:.2f} s)"
+                )
+    else:
+        mel = log_mel_spectrogram(waveform, target_frames=FRAMES).float()
+        policy = TokenPolicy(config, timestamps=False)
+        generated, (frontend, encoder) = npu.window(mel, PROMPT, policy)
+        eos = generated[-1] == EOS
+        token_match = None
+        if not args.no_reference:
+            cpu = CpuWhisper(snapshot)
+            start = time.perf_counter()
+            ref_tokens, (ref_frontend, ref_encoder) = cpu.window(mel, PROMPT, policy)
+            print(f"CPU FP32 reference: {time.perf_counter() - start:.3f} s")
+            cosine = F.cosine_similarity(
+                encoder.flatten(), ref_encoder.flatten(), dim=0
+            ).item()
+            print(f"Frontend NRMSE vs FP32: {100 * nrmse(frontend, ref_frontend):.3f}%")
+            print(f"Encoder NRMSE vs FP32: {100 * nrmse(encoder, ref_encoder):.3f}%")
+            print(f"Encoder cosine vs FP32: {cosine:.6f}")
+            token_match = generated == ref_tokens
+            if not token_match:
+                print("  CPU FP32 token IDs:", ref_tokens)
 
+    text = tokenizer.decode(
+        [t for t in generated if t < EOS], skip_special_tokens=True
+    ).strip()
     print()
     print("Token IDs:", generated)
-    print("Text:", text.strip())
+    print("Text:", text)
     print("EOS reached:", eos)
-
-    token_match = None
-    if reference is not None:
-        ref_frontend, ref_encoder, ref_tokens = reference
-        cosine = F.cosine_similarity(
-            encoder.flatten(), ref_encoder.flatten(), dim=0
-        ).item()
-        print(f"Frontend NRMSE vs FP32: {100 * nrmse(frontend, ref_frontend):.3f}%")
-        print(f"Encoder NRMSE vs FP32: {100 * nrmse(encoder, ref_encoder):.3f}%")
-        print(f"Encoder cosine vs FP32: {cosine:.6f}")
-        token_match = generated == ref_tokens
-        print(f"Exact CPU FP32 token match: {token_match}")
-        if not token_match:
-            first_diff = next(
-                (i for i, (a, b) in enumerate(zip(generated, ref_tokens)) if a != b),
-                min(len(generated), len(ref_tokens)),
-            )
-            print(f"  first difference at token {first_diff}")
-            print("  CPU FP32 token IDs:", ref_tokens)
+    if token_match is not None:
+        if long_form:
+            print(f"CPU FP32 match (text exact, timestamps +-2): {token_match}")
+        else:
+            print(f"Exact CPU FP32 token match: {token_match}")
 
     if args.reference_text:
         truth = args.reference_text.read_text("utf-8")
         print(f"WER vs reference text: {100 * word_error_rate(truth, text):.1f}%")
 
+    timings = npu.timings
+    decode_tokens = timings.pop("decode_tokens")
     compute = sum(v for k, v in timings.items() if not k.endswith("_setup"))
     for key, value in timings.items():
         print(f"  {key:16s} {value:8.3f} s")
     print(f"  compute total    {compute:8.3f} s  (excludes kernel setup)")
     print(f"  realtime factor  {compute / duration:8.3f}")
-    print(f"  decode rate      {(len(generated) - 1) / timings['decode']:8.2f} token/s")
+    print(f"  decode rate      {decode_tokens / timings['decode']:8.2f} token/s")
 
     if not eos:
         raise SystemExit("FAILED: no end-of-text token")

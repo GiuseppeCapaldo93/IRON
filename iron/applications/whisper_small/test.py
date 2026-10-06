@@ -17,10 +17,12 @@ MAX_ENCODER_NRMSE_PERCENT = 5.0
 
 checkpoint_value = os.environ.get("WHISPER_SAFE")
 wav_value = os.environ.get("WHISPER_TEST_WAV")
+long_wav_value = os.environ.get("WHISPER_LONG_TEST_WAV")
 
 checkpoint = Path(checkpoint_value).expanduser() if checkpoint_value else None
 
 wav = Path(wav_value).expanduser() if wav_value else None
+long_wav = Path(long_wav_value).expanduser() if long_wav_value else None
 
 
 @pytest.mark.extensive
@@ -128,3 +130,41 @@ def test_whisper_small_transcription():
         f"Full-window encoder NRMSE {nrmse_percent:.6f}% exceeds "
         f"{MAX_ENCODER_NRMSE_PERCENT:.6f}%"
     )
+
+
+@pytest.mark.extensive
+@pytest.mark.supported_devices("npu1")
+@pytest.mark.metrics(
+    long_form_decode_tokens_per_second=(r"decode rate\s+(?P<value>[\d\.]+)"),
+)
+@pytest.mark.skipif(
+    checkpoint is None or not checkpoint.is_file(),
+    reason="WHISPER_SAFE Whisper-small checkpoint not found",
+)
+@pytest.mark.skipif(
+    long_wav is None or not long_wav.is_file(),
+    reason="WHISPER_LONG_TEST_WAV audio longer than 30 s not found",
+)
+def test_whisper_small_long_form():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(test_dir / "whisper_pipeline.py"),
+            "--wav",
+            str(long_wav),
+        ],
+        cwd=test_dir,
+        capture_output=True,
+        text=True,
+    )
+
+    print(result.stdout)
+    print(result.stderr)
+
+    assert result.returncode == 0, (
+        "Whisper-small long-form transcription failed "
+        f"with return code {result.returncode}\n"
+        f"stderr:\n{result.stderr}"
+    )
+    assert "long-form" in result.stdout
+    assert "CPU FP32 match (text exact, timestamps +-2): True" in result.stdout

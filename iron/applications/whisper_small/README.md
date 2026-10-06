@@ -7,15 +7,16 @@ SPDX-License-Identifier: Apache-2.0
 
 This example runs Whisper-small on AMD Phoenix/NPU1 using IRON and mlir-aie.
 
-- `whisper_pipeline.py` transcribes one 30-second window end to end: WAV in,
-  text out, with the frontend, encoder and decoder matrix products on the NPU.
+- `whisper_pipeline.py` transcribes audio end to end: WAV in, text out, with
+  the frontend, encoder and decoder matrix products on the NPU. Audio longer
+  than 30 s is decoded window by window.
 - `whisper_encoder.py` is the original short-geometry encoder validation
   (128 Mel frames, 64 encoder tokens).
 
 ## End-to-end transcription
 
 `whisper_pipeline.py` uses Whisper's canonical geometry (3000 Mel frames,
-1500 encoder tokens) and greedy decoding without timestamps.
+1500 encoder tokens) and greedy decoding.
 
 | Stage | NPU | CPU |
 | --- | --- | --- |
@@ -23,15 +24,15 @@ This example runs Whisper-small on AMD Phoenix/NPU1 using IRON and mlir-aie.
 | Frontend | conv1 and conv2 as GEMMs, GELU | im2col |
 | Encoder (12 blocks) | Q/K/V/out, score, value, fc1, fc2 GEMMs | LayerNorm, masked softmax, GELU |
 | Cross-attention K/V | 768x768 GEMM for all decoder blocks | |
-| Prefill (4 prompt tokens) | LayerNorm, projection, score, fc1, fc2 GEMMs | softmax |
-| Decode (1 token per step) | fused Q/K/V, output, fc1, fc2 GEMVs | LayerNorm, attention, GELU |
-| Token selection | | vocabulary projection, suppression, argmax |
+| Decoder (prompt, then 1 token per step) | fused Q/K/V, output, fc1, fc2 GEMVs | LayerNorm, attention, GELU |
+| Token selection | | vocabulary projection, suppression, timestamp rules, argmax |
 
 The encoder GEMMs use all four Phoenix columns, except the value GEMM: its
-N=64 is not a multiple of 4 x `tile_n`. Decode steps use four-column GEMVs
-with the decoder weights resident in NPU-visible BF16 buffers, which avoids
-padding a single token to a 64-row GEMM. Each phase stays within the NPU1
-context budget and releases its contexts before the next phase starts.
+N=64 is not a multiple of 4 x `tile_n`. The decoder processes the prompt and
+every generated token one at a time with four-column GEMVs, with the decoder
+weights resident in NPU-visible BF16 buffers, which avoids padding a single
+token to a 64-row GEMM. Each phase stays within the NPU1 context budget and
+releases its contexts before the next phase starts.
 
 Run it with:
 
@@ -39,29 +40,43 @@ Run it with:
 python iron/applications/whisper_small/whisper_pipeline.py --wav clip.wav
 ```
 
+Audio up to 30 s is decoded as one window without timestamps. Longer audio
+(or any audio with `--long-form`) follows OpenAI Whisper's sequential
+long-form algorithm: each 30 s window is decoded with timestamps, and the next
+window starts at the last complete timestamp pair. Decoding is greedy, without
+temperature fallback and without conditioning on the previous window's text;
+this reproduces the text of Hugging Face `generate(return_timestamps=True,
+condition_on_prev_tokens=False)` on the CPU. The segments are printed with
+their start and end times.
+
 The script also runs a Hugging Face FP32 CPU reference on the same log-Mel
-features and requires an exact token match; it exits non-zero on a mismatch
-or when no end-of-text token is produced. `--reference-text transcript.txt`
-reports the word error rate against a transcript; `--no-reference` skips the
-CPU reference. `transformers` is required for the tokenizer in either case.
+features, after the NPU run. For one window it requires an exact token match.
+For long-form audio, the reference decodes the same windows the NPU chose; the
+text tokens must match exactly and each timestamp within two steps (0.04 s),
+since adjacent timestamps are often near-ties in BF16. The script exits
+non-zero on a mismatch or when a window produces no end-of-text token.
+`--reference-text transcript.txt` reports the word error rate against a
+transcript; `--no-reference` skips the CPU reference. `transformers` is
+required for the tokenizer in either case.
 
 Compiled kernels go to `--build-dir`, `$IRON_WHISPER_BUILD_DIR`, or
 `<artifact dir>/pipeline-build`. On Windows, use a short path such as
 `C:\iw` to stay below path-length limits. The first run compiles all kernels
-(about 6 minutes).
+(several minutes).
 
 Validation on Phoenix (warm kernel cache, LibriSpeech clips):
 
-| Clip | Audio | Encoder NRMSE | Tokens | WER | Compute | Decode |
-| --- | ---: | ---: | --- | ---: | ---: | ---: |
-| 1919-142785-0007 | 26.6 s | 1.85% | exact | 0.0% | 10.8 s | 12.8 tok/s |
-| 3170-137482-0000 | 28.0 s | 2.11% | exact | 1.5% | 10.6 s | 13.2 tok/s |
-| 5.9 s test clip | 5.9 s | 2.70% | exact | 0.0% | 6.0 s | 13.1 tok/s |
+| Clip | Audio | Windows | Encoder NRMSE | Tokens | WER | Compute | Decode |
+| --- | ---: | ---: | ---: | --- | ---: | ---: | ---: |
+| 1919-142785-0007 | 26.6 s | 1 | 1.85% | exact | 0.0% | 11.7 s | 13.4 tok/s |
+| 3170-137482-0000 | 28.0 s | 1 | 2.11% | exact | 1.5% | 11.5 s | 13.1 tok/s |
+| 5.9 s test clip | 5.9 s | 1 | 2.70% | exact | 0.0% | 7.4 s | 13.4 tok/s |
+| 422-122949-0013 | 32.6 s | 2 | | text exact, timestamps exact | 6.0% | 18.1 s | 13.9 tok/s |
+| 2902-9006-0005, -0007, -0015 joined | 97.0 s | 4 | | text exact, timestamps within 0.02 s | 2.3% | 46.9 s | 11.9 tok/s |
 
-The CPU FP32 reference has the same word error rate on every clip.
-
-Audio longer than 30 s is truncated to the first window; long-form
-chunking is not implemented yet.
+The CPU FP32 reference has the same word error rate on every clip. Timings
+vary by up to 2x between identical runs on Windows; the table shows typical
+values.
 
 ## Encoder-only validation
 
@@ -201,9 +216,9 @@ absolute error and `5.13e-9` RMSE.
 
 ## Current limitations
 
-- Audio longer than 30 s is truncated; there is no long-form chunking.
-- Greedy decoding only, without timestamps, beam search or temperature
-  fallback.
+- Greedy decoding only, without beam search, temperature fallback,
+  no-speech detection or conditioning on the previous window's text.
+  Timestamps are produced only in long-form mode.
 - Attention softmax, LayerNorm in the encoder and decode step, and the
   vocabulary projection still run on the CPU. The fused `mha` operator
   targets NPU2 only.
