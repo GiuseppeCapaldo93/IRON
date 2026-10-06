@@ -8,9 +8,13 @@ Each 30 s window runs three phases, each kept within the NPU1 context cache
 and cleaned up before the next:
 
 1. frontend: conv1 / GELU / conv2 / GELU on the NPU at 3000 Mel frames.
-2. encoder: 12 blocks at 1536 physical rows (1500 logical) with four-column
-   GEMMs; LayerNorm, GELU and masked softmax on the CPU. The resident 768x768
-   GEMM then computes the cross-attention K/V of every decoder block.
+2. encoder: 12 blocks at 1536 physical rows (1500 logical) entirely on NPU
+   kernels: four-column GEMMs, LayerNorm, masked softmax, GELU and the fc1
+   bias add, in two chained xclbins (two contexts). The LayerNorm scale and
+   shift fold into the following GEMM weights. The host splits and merges
+   attention heads, adds the remaining biases and accumulates the residual
+   stream in FP32. The same 768x768 GEMM then computes the cross-attention
+   K/V of every decoder block.
 3. decoder: the prompt, then one generated token per step, with four-column
    NPU GEMVs and resident BF16 weights; LayerNorm, attention and GELU on the
    CPU.
@@ -42,9 +46,14 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 
+from iron.common import compilation as comp
+from iron.common.sequence import SeparateDispatch
+from iron.operators.elementwise_add.op import ElementwiseAdd
 from iron.operators.gelu.op import GELU
 from iron.operators.gemm.op import GEMM
 from iron.operators.gemv.op import GEMV
+from iron.operators.layer_norm.op import LayerNorm
+from iron.operators.softmax.op import Softmax
 
 from whisper_audio import load_wav, log_mel_spectrogram, log_mel_spectrogram_long
 from whisper_common import (
@@ -181,18 +190,74 @@ def direct_callable(op):
     back to the generic callable for kernels it does not cover.
     """
 
+    call = kernel_callable(
+        op.xclbin_artifact.filename,
+        op.xclbin_artifact.kernel_name,
+        op.insts_artifact.filename,
+    )
+    return call or op.get_callable()
+
+
+class _ChainedBuild:
+    """The part of ``OperatorSequence`` that ``SeparateDispatch`` compiles."""
+
+    def __init__(self, name, ops):
+        self.name = name
+        self.ops = ops
+        self.artifacts = comp.CompilationArtifactGraph()
+
+    def unique_operators(self):
+        return self.ops
+
+    def add_artifacts(self, artifacts):
+        for artifact in artifacts:
+            self.artifacts.add(artifact)
+
+
+def chained(name, build_root, factories):
+    """Compile operators into one chained xclbin, so they share one context.
+
+    NPU1 has no full-ELF dispatch, and its context cache holds at most six
+    contexts. IRON's ``SeparateDispatch`` links each operator's xclbin into
+    the next one; every kernel of the last xclbin is then callable within
+    one hardware context. ``factories`` maps names to functions building an
+    operator for a given ``AIEContext``; returns callables by name.
+    """
+
+    context = make_context(build_root, name)
+    ops = {key: make(context) for key, make in factories.items()}
+    build = _ChainedBuild(name, list(ops.values()))
+    dispatch = SeparateDispatch()
+    dispatch.set_up_artifacts(build)
+    comp.compile(context.compilation_rules, build.artifacts, context.build_dir)
+    calls = {}
+    for key, op in ops.items():
+        calls[key] = kernel_callable(
+            dispatch.combined_xclbin.filename,
+            dispatch.op_kernel_name_map[id(op)],
+            dispatch.op_insts_map[id(op)].filename,
+        )
+        if calls[key] is None:
+            raise RuntimeError(f"{name}/{key}: not an xclbin kernel")
+    return calls
+
+
+def kernel_callable(xclbin_path, kernel_name, insts_path):
+    """A callable running one xclbin kernel with a reused XRT run object, or
+    None for kernels it does not cover."""
+
     import pyxrt
     from aie.utils.npukernel import NPUKernel
 
     handle = runtime_backend.load(
         NPUKernel(
-            xclbin_path=op.xclbin_artifact.filename,
-            kernel_name=op.xclbin_artifact.kernel_name,
-            insts_path=op.insts_artifact.filename,
+            xclbin_path=xclbin_path,
+            kernel_name=kernel_name,
+            insts_path=insts_path,
         )
     )
     if getattr(handle, "is_full_elf", False) or not handle.insts_bo:
-        return op.get_callable()
+        return None
     run = pyxrt.run(handle.kernel)
     for index, value in enumerate((3, handle.insts_bo, handle.insts.nbytes)):
         run.set_arg(index, value)
@@ -207,7 +272,7 @@ def direct_callable(op):
         run.start()
         state = run.wait()
         if state != completed:
-            raise RuntimeError(f"{op.xclbin_artifact.kernel_name}: kernel {state}")
+            raise RuntimeError(f"{kernel_name}: kernel {state}")
 
     return call
 
@@ -222,32 +287,6 @@ def write_bf16(buffer, x):
     bits = x.to(torch.bfloat16).contiguous().view(torch.uint16).numpy()
     with buffer.overwrite() as data:
         data.view(np.uint16)[...] = bits.reshape(data.shape)
-
-
-class BufferedGemm:
-    """A compiled GEMM with its input and output buffers allocated once.
-
-    Allocating XRT buffers costs more than the NPU work of most encoder
-    GEMMs, so each call only copies data into the existing buffers.
-    """
-
-    def __init__(self, M, K, N, build_root, name, cols=COLUMNS):
-        tc = aie_utils.DEFAULT_TENSOR_CLASS
-        bf = np.dtype("bfloat16")
-        self.op, self.fn = gemm(M, K, N, build_root, name, tile_m=16, cols=cols)
-        self.a = tc((M, K), dtype=bf)
-        self.b = tc((K, N), dtype=bf)
-        self.c = tc((M, N), dtype=bf)
-
-    def __call__(self, a, b):
-        """``a @ b`` in FP32; ``b`` is a torch tensor or a resident buffer."""
-
-        write_bf16(self.a, a)
-        if isinstance(b, torch.Tensor):
-            write_bf16(self.b, b)
-            b = self.b
-        self.fn(self.a, b, self.c)
-        return self.c.to_torch().float()
 
 
 def gelu_npu(x, build_root, name):
@@ -329,90 +368,235 @@ def run_frontend_full(mel, checkpoint, build_root):
 # ============================================================================
 
 
+def folded(norm, weight, bias=None, scale=1.0):
+    """Fold a LayerNorm's scale and shift into the projection that follows.
+
+    ``LN(x) * g + beta`` then ``@ W.T + b`` equals ``n @ (g * W.T)`` plus
+    ``beta @ W.T + b``, where ``n`` is the normalized ``x`` without affine
+    parameters, which is what the NPU LayerNorm computes. Returns the (K, N)
+    weight and the (N,) bias, both multiplied by ``scale``.
+    """
+
+    gamma, beta = (t.float() for t in norm)
+    weight = weight.float().T
+    shift = beta @ weight
+    if bias is not None:
+        shift = shift + bias.float()
+    return gamma[:, None] * weight * scale, shift * scale
+
+
+def broadcast(bias):
+    """A bias as a resident (SEQ_PAD, N) buffer, for the NPU element-wise add."""
+
+    return resident(bias.float().expand(SEQ_PAD, -1))
+
+
 def resident_encoder_weights(w):
-    """Encoder block projection weights as resident (K, N) BF16 buffers."""
+    """Encoder block weights as resident BF16 buffers, folded for the NPU.
 
+    The attention LayerNorm folds into Q, K and V, the softmax scale into Q,
+    and the MLP LayerNorm into the first MLP layer. Attention rows sum to
+    one, so the V bias passes through attention unchanged and folds into the
+    output bias. A bias on K adds the same amount to every score of a query,
+    which softmax ignores, so K has none. Biases are added in FP32 on the
+    host wherever the result passes through it anyway: Q on its way to the
+    per-head GEMMs, and the output and second MLP layers into the residual
+    stream.
+    """
+
+    ln = (w["attn_ln.weight"], w["attn_ln.bias"])
+    q, q_bias = folded(ln, w["attn.query.weight"], w["attn.query.bias"], SCALE)
+    k, _ = folded(ln, w["attn.key.weight"])
+    v, v_bias = folded(ln, w["attn.value.weight"], w["attn.value.bias"])
+    out = w["attn.out.weight"].float().T
+    out_bias = v_bias @ out + w["attn.out.bias"].float()
+    fc1, fc1_bias = folded(
+        (w["mlp_ln.weight"], w["mlp_ln.bias"]), w["mlp.0.weight"], w["mlp.0.bias"]
+    )
     return {
-        name: resident(w[f"{name}.weight"].float().T)
-        for name in (
-            "attn.query",
-            "attn.key",
-            "attn.value",
-            "attn.out",
-            "mlp.0",
-            "mlp.2",
-        )
+        "q": resident(q),
+        "q_bias": q_bias,
+        "k": resident(k),
+        "v": resident(v),
+        "out": resident(out),
+        "out_bias": out_bias,
+        "fc1": resident(fc1),
+        "fc1_bias": broadcast(fc1_bias),
+        "fc2": resident(w["mlp.2.weight"].float().T),
+        "fc2_bias": w["mlp.2.bias"].float(),
     }
 
 
-def resident_cross_weights(w):
-    return {
-        name: resident(w[f"encoder_attn.{name}.weight"].float().T)
-        for name in ("k_proj", "v_proj")
-    }
+def resident_cross_weights(w, encoder_ln):
+    """Cross-attention K/V weights with the final encoder LayerNorm folded in.
+
+    As in the encoder, the K bias that folding produces is dropped; the V
+    bias is added in FP32 on the host.
+    """
+
+    k, _ = folded(encoder_ln, w["encoder_attn.k_proj.weight"])
+    v, v_bias = folded(
+        encoder_ln, w["encoder_attn.v_proj.weight"], w["encoder_attn.v_proj.bias"]
+    )
+    return {"k": resident(k), "v": resident(v), "v_bias": v_bias}
 
 
-class FullWindowEncoderRuntime:
+class NpuEncoderRuntime:
+    """Encoder blocks and cross-attention K/V, computed on the NPU.
+
+    The operators live in two chained xclbins, so the encoder holds two NPU
+    contexts. The host rearranges Q, K, V and the attention output between
+    the per-head GEMMs, and accumulates the residual stream in FP32: kept in
+    BF16 it would round twelve times over and roughly double the encoder
+    error.
+    """
+
     def __init__(self, build_root):
-        def make(K, N, name, cols=COLUMNS):
-            return BufferedGemm(SEQ_PAD, K, N, build_root, name, cols=cols)
+        rows = SEQ_PAD
 
-        self.p768 = make(STATE, STATE, "gemm-768-768")
-        self.score = make(HEAD_DIM, SEQ_PAD, "score")
-        # N=64 is not a multiple of COLUMNS * tile_n, so this one uses one column.
-        self.value = make(SEQ_PAD, HEAD_DIM, "value", cols=1)
-        self.fc1 = make(STATE, MLP, "gemm-768-3072")
-        self.fc2 = make(MLP, STATE, "gemm-3072-768")
-        self.key_mask = torch.zeros(SEQ_PAD, dtype=torch.bool)
-        self.key_mask[SEQ:] = True
+        def gemm_op(K, N, cols=COLUMNS):
+            return lambda context: GEMM(
+                M=rows,
+                K=K,
+                N=N,
+                num_aie_columns=cols,
+                tile_m=16,
+                tile_k=64,
+                tile_n=64,
+                prio_accuracy=True,
+                emulate_bf16_mmul_with_bfp16=False,
+                context=context,
+            )
+
+        # On NPU1 only the last 8 kernels of one xclbin run; earlier ones time
+        # out. The operators are therefore split into two chains.
+        self.npu = chained(
+            "encoder_gemm",
+            build_root,
+            {
+                "p768": gemm_op(STATE, STATE),
+                "score": gemm_op(HEAD_DIM, rows),
+                # N=64 is not a multiple of COLUMNS * tile_n: one column.
+                "value": gemm_op(rows, HEAD_DIM, cols=1),
+                "fc1": gemm_op(STATE, MLP),
+                "fc2": gemm_op(MLP, STATE),
+            },
+        )
+        self.npu |= chained(
+            "encoder_ops",
+            build_root,
+            {
+                "norm": lambda context: LayerNorm(
+                    size=rows * STATE,
+                    num_aie_columns=COLUMNS,
+                    num_channels=1,
+                    tile_size=STATE,
+                    context=context,
+                ),
+                # Keys from SEQ on are padding; the kernel masks them to -inf.
+                "softmax": lambda context: Softmax(
+                    rows=rows,
+                    cols=rows,
+                    num_aie_columns=COLUMNS,
+                    rtp_vector_size=SEQ,
+                    context=context,
+                ),
+                "gelu": lambda context: GELU(
+                    size=rows * MLP,
+                    num_aie_columns=COLUMNS,
+                    num_channels=1,
+                    tile_size=MLP,
+                    context=context,
+                ),
+                "bias_mlp": lambda context: ElementwiseAdd(
+                    size=rows * MLP,
+                    tile_size=MLP,
+                    num_aie_columns=COLUMNS,
+                    context=context,
+                ),
+            },
+        )
+
+        tc = aie_utils.DEFAULT_TENSOR_CLASS
+        bf = np.dtype("bfloat16")
+
+        def buffer(*shape):
+            return tc(shape, dtype=bf)
+
+        self.x = buffer(rows, STATE)
+        self.mid = buffer(rows, STATE)
+        self.norm = buffer(rows, STATE)
+        self.proj = buffer(rows, STATE)
+        self.q = buffer(rows, STATE)
+        self.k = buffer(rows, STATE)
+        self.v = buffer(rows, STATE)
+        self.attention = buffer(rows, STATE)
+        self.head_q = buffer(rows, HEAD_DIM)
+        self.head_kt = buffer(HEAD_DIM, rows)
+        self.head_v = buffer(rows, HEAD_DIM)
+        self.scores = buffer(rows, rows)
+        self.probs = buffer(rows, rows)
+        self.heads = [buffer(rows, HEAD_DIM) for _ in range(HEADS)]
+        self.up = buffer(rows, MLP)
+        self.up_biased = buffer(rows, MLP)
 
     @staticmethod
-    def layer_norm(x, weight, bias):
-        return F.layer_norm(bf16(x), (STATE,), weight.float(), bias.float())
+    def read(buffer, columns=STATE):
+        return buffer.to_torch().reshape(-1, columns).float()
 
-    def projection(self, x, weight, bias):
-        out = self.p768(x, weight)
-        if bias is not None:
-            out += bias.float()
-        return out
+    def load(self, x):
+        self.residual = torch.zeros((SEQ_PAD, STATE))
+        self.residual[: x.shape[0]] = x.float()
+        write_bf16(self.x, self.residual)
 
-    def block(self, x, w, r):
-        """One encoder block; ``w`` holds the FP32 weights and biases, ``r``
-        the resident projection weights."""
+    def block(self, r):
+        """One encoder block on ``self.x``; ``r`` holds the folded resident
+        weights of ``resident_encoder_weights``."""
 
-        h = self.layer_norm(x, w["attn_ln.weight"], w["attn_ln.bias"])
-        q = self.projection(h, r["attn.query"], w["attn.query.bias"])
-        k = self.projection(h, r["attn.key"], None)
-        v = self.projection(h, r["attn.value"], w["attn.value.bias"])
-        qh, kh, vh = split_heads(q), split_heads(k), split_heads(v)
-
-        heads = []
+        npu = self.npu
+        npu["norm"](self.x, self.norm)
+        npu["p768"](self.norm, r["q"], self.q)
+        npu["p768"](self.norm, r["k"], self.k)
+        npu["p768"](self.norm, r["v"], self.v)
+        qh = split_heads(self.read(self.q) + r["q_bias"])
+        kh = split_heads(self.read(self.k))
+        vh = split_heads(self.read(self.v))
         for head in range(HEADS):
-            scores = self.score(qh[head] * SCALE, kh[head].T)
-            scores.masked_fill_(self.key_mask, float("-inf"))
-            probs = torch.softmax(scores, dim=-1)
-            heads.append(self.value(probs, vh[head]))
+            write_bf16(self.head_q, qh[head])
+            write_bf16(self.head_kt, kh[head].T)
+            write_bf16(self.head_v, vh[head])
+            npu["score"](self.head_q, self.head_kt, self.scores)
+            npu["softmax"](self.scores, self.probs)
+            npu["value"](self.probs, self.head_v, self.heads[head])
+        heads = torch.stack([self.read(h, HEAD_DIM) for h in self.heads])
+        write_bf16(self.attention, merge_heads(heads))
 
-        x = x + self.projection(
-            merge_heads(torch.stack(heads)), r["attn.out"], w["attn.out.bias"]
-        )
+        npu["p768"](self.attention, r["out"], self.proj)
+        self.residual += self.read(self.proj) + r["out_bias"]
+        write_bf16(self.mid, self.residual)
 
-        h = self.layer_norm(x, w["mlp_ln.weight"], w["mlp_ln.bias"])
-        up = self.fc1(h, r["mlp.0"])
-        up += w["mlp.0.bias"].float()
-        act = F.gelu(bf16(up))
-        down = self.fc2(act, r["mlp.2"])
-        down += w["mlp.2.bias"].float()
-        x = x + down
-        x[SEQ:] = 0.0
-        return x
+        npu["norm"](self.mid, self.norm)
+        npu["fc1"](self.norm, r["fc1"], self.up)
+        npu["bias_mlp"](self.up, r["fc1_bias"], self.up_biased)
+        npu["gelu"](self.up_biased, self.up)
+        npu["fc2"](self.up, r["fc2"], self.proj)
+        self.residual += self.read(self.proj) + r["fc2_bias"]
+        write_bf16(self.x, self.residual)
 
-    def cross_kv(self, encoder_pad, decoder_weights, cross_weights):
+    def finish(self):
+        """Apply the final encoder LayerNorm without its affine parameters,
+        which ``resident_cross_weights`` folds; returns the normalized rows."""
+
+        self.npu["norm"](self.x, self.norm)
+        return self.read(self.norm)[:SEQ]
+
+    def cross_kv(self, cross_weights):
         caches = []
-        for w, r in zip(decoder_weights, cross_weights):
-            k = self.p768(encoder_pad, r["k_proj"])[:SEQ]
-            v = self.p768(encoder_pad, r["v_proj"])[:SEQ]
-            v += w["encoder_attn.v_proj.bias"]
+        for r in cross_weights:
+            self.npu["p768"](self.norm, r["k"], self.k)
+            self.npu["p768"](self.norm, r["v"], self.v)
+            k = self.read(self.k)[:SEQ]
+            v = self.read(self.v)[:SEQ] + r["v_bias"]
             caches.append((split_heads(k), split_heads(v)))
         return caches
 
@@ -629,15 +813,17 @@ class PhoenixWhisper:
         self.encoder_resident = [
             resident_encoder_weights(w) for w in self.encoder_weights
         ]
-        self.cross_resident = [resident_cross_weights(w) for w in self.decoder_weights]
-        self.decoder_resident = [
-            GemvDecoderRuntime.resident_weights(w) for w in self.decoder_weights
-        ]
         with safe_open(str(checkpoint), framework="pt", device="cpu") as h:
             self.encoder_ln = (
                 h.get_tensor("model.encoder.layer_norm.weight").float(),
                 h.get_tensor("model.encoder.layer_norm.bias").float(),
             )
+        self.cross_resident = [
+            resident_cross_weights(w, self.encoder_ln) for w in self.decoder_weights
+        ]
+        self.decoder_resident = [
+            GemvDecoderRuntime.resident_weights(w) for w in self.decoder_weights
+        ]
         self.token_embedding = load_decoder_embedding(checkpoint)
         self.position_embedding = load_decoder_position_embedding(checkpoint)
         self.final_ln = tuple(
@@ -658,27 +844,28 @@ class PhoenixWhisper:
         cleanup("frontend -> encoder")
 
         start = time.perf_counter()
-        runtime = FullWindowEncoderRuntime(self.build_root / "encoder")
-        check_contexts("encoder resident")
+        runtime = NpuEncoderRuntime(self.build_root / "encoder")
+        check_contexts("encoder resident", limit=2)
         self._time("encoder_setup", start)
 
         start = time.perf_counter()
+        runtime.load(x)
         for block in range(BLOCKS):
-            x = runtime.block(
-                x, self.encoder_weights[block], self.encoder_resident[block]
-            )
-            if not torch.isfinite(x[:SEQ]).all():
-                raise RuntimeError(f"Encoder block {block} produced non-finite values")
-        encoder = F.layer_norm(bf16(x[:SEQ]), (STATE,), *self.encoder_ln)
+            runtime.block(self.encoder_resident[block])
+        normalized = runtime.finish()
+        if not torch.isfinite(normalized).all():
+            raise RuntimeError("Encoder produced non-finite values")
         self._time("encoder", start)
 
         start = time.perf_counter()
-        cross = runtime.cross_kv(
-            pad_to(encoder, SEQ_PAD), self.decoder_weights, self.cross_resident
-        )
+        cross = runtime.cross_kv(self.cross_resident)
         self._time("cross_kv", start)
         del runtime
         cleanup("encoder -> decoder")
+        # The pipeline never needs the encoder output itself; it is formed
+        # here only for the accuracy report.
+        gamma, beta = self.encoder_ln
+        encoder = normalized * gamma + beta
         return frontend, encoder, cross
 
     def decode(self, cross, prompt, policy):

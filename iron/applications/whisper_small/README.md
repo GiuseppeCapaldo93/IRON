@@ -22,13 +22,24 @@ This example runs Whisper-small on AMD Phoenix/NPU1 using IRON and mlir-aie.
 | --- | --- | --- |
 | Preprocessing | | log-Mel features |
 | Frontend | conv1 and conv2 as GEMMs, GELU | im2col |
-| Encoder (12 blocks) | Q/K/V/out, score, value, fc1, fc2 GEMMs | LayerNorm, masked softmax, GELU |
+| Encoder (12 blocks) | Q/K/V/out, score, value, fc1, fc2 GEMMs; LayerNorm, masked softmax, GELU, fc1 bias | head split/merge, other biases, FP32 residual stream |
 | Cross-attention K/V | 768x768 GEMM for all decoder blocks | |
 | Decoder (prompt, then 1 token per step) | fused Q/K/V, output, fc1, fc2 GEMVs | LayerNorm, attention, GELU |
 | Token selection | | vocabulary projection, suppression, timestamp rules, argmax |
 
 The encoder GEMMs use all four Phoenix columns, except the value GEMM: its
-N=64 is not a multiple of 4 x `tile_n`. The decoder processes the prompt and
+N=64 is not a multiple of 4 x `tile_n`. The NPU LayerNorm has no scale or
+shift, so each LayerNorm's affine parameters fold into the GEMM weights that
+follow it, and the softmax scale folds into Q. The encoder's nine kernels are
+built as two chained xclbins (GEMMs, and LayerNorm/softmax/GELU/add), so the
+encoder holds two NPU contexts: in one xclbin with all nine, the first
+kernels time out on NPU1 (only the last eight ran in testing). The host
+still splits and merges the attention heads, adds the biases whose results
+pass through it anyway, and accumulates the residual stream in FP32; a BF16
+residual stream, rounded at each of the 24 residual adds, about doubled the
+encoder error in a CPU emulation.
+
+The decoder processes the prompt and
 every generated token one at a time with four-column GEMVs, with the decoder
 weights resident in NPU-visible BF16 buffers, which avoids padding a single
 token to a 64-row GEMM. All NPU weights are converted to resident BF16 buffers
@@ -70,17 +81,37 @@ Compiled kernels go to `--build-dir`, `$IRON_WHISPER_BUILD_DIR`, or
 
 Validation on Phoenix (warm kernel cache, LibriSpeech clips):
 
-| Clip | Audio | Windows | Encoder NRMSE | Tokens | WER | Compute | Decode |
-| --- | ---: | ---: | ---: | --- | ---: | ---: | ---: |
-| 1919-142785-0007 | 26.6 s | 1 | 1.85% | exact | 0.0% | 9.3 s | 13.0 tok/s |
-| 3170-137482-0000 | 28.0 s | 1 | 2.11% | exact | 1.5% | 9.3 s | 14.2 tok/s |
-| 5.9 s test clip | 5.9 s | 1 | 2.70% | exact | 0.0% | 5.3 s | 12.6 tok/s |
-| 422-122949-0013 | 32.6 s | 2 | | text exact, timestamps exact | 6.0% | 14.7 s | 13.6 tok/s |
-| 2902-9006-0005, -0007, -0015 joined | 97.0 s | 4 | | text exact, timestamps within 0.02 s | 2.3% | 42.6 s | 11.8 tok/s |
+| Clip | Audio | Windows | Encoder NRMSE | Tokens | WER | Encoder | Compute | Decode |
+| --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| 1919-142785-0007 | 26.6 s | 1 | 4.40% | exact | 0.0% | 1.5 s | 8.6 s | 13.9 tok/s |
+| 3170-137482-0000 | 28.0 s | 1 | 3.56% | exact | 1.5% | 1.3 s | 8.5 s | 13.5 tok/s |
+| 5.9 s test clip | 5.9 s | 1 | 5.29% | exact | 0.0% | 1.3 s | 3.8 s | 15.1 tok/s |
+| 422-122949-0013 | 32.6 s | 2 | | text exact, timestamps exact | 6.0% | 2.7 s | 13.6 s | 13.4 tok/s |
+| 2902-9006-0005, -0007, -0015 joined | 97.0 s | 4 | | **mismatch**, see below | 2.3% | 5.6 s | 35.8 s | 13.7 tok/s |
 
 The CPU FP32 reference has the same word error rate on every clip. Timings
 vary by up to 2x between identical runs on Windows; the table shows typical
-values.
+values. Before the encoder's LayerNorm, softmax and GELU moved to the NPU,
+the encoder took about 2.4 s per window, with an encoder NRMSE of
+1.9-2.7%.
+
+> [!WARNING]
+> **Known accuracy cost of the NPU LayerNorm, softmax and GELU kernels.**
+> With these kernels on the NPU, the encoder NRMSE against FP32 rises from
+> 1.9-2.7% to 3.6-5.3%. Replacing all three with exact CPU functions (still
+> BF16 outputs) brings it back to 2.2% on 1919-142785-0007; each kernel
+> contributes. The NPU GELU uses the tanh approximation, while Whisper uses
+> the exact erf form.
+>
+> The 97 s clip no longer matches the CPU reference. In its first window,
+> after "...swim with the stream", the CPU FP32 model prefers "." over ","
+> by only 0.054 logits (35.880 vs 35.827), and the NPU picks ",". This
+> changes "stream. To accept" to "stream, to accept" and moves one
+> timestamp; the word error rate is unchanged. This clip already fails with
+> exact CPU LayerNorm, softmax and GELU, so the tie is decided by BF16
+> rounding as a whole, not by one kernel. The pipeline reports this as a
+> mismatch and exits non-zero. Better NPU accuracy here needs more precise
+> kernels (an erf GELU, a higher-precision softmax and LayerNorm).
 
 ## Encoder-only validation
 
@@ -223,8 +254,11 @@ absolute error and `5.13e-9` RMSE.
 - Greedy decoding only, without beam search, temperature fallback,
   no-speech detection or conditioning on the previous window's text.
   Timestamps are produced only in long-form mode.
-- Attention softmax, LayerNorm in the encoder and decode step, and the
-  vocabulary projection still run on the CPU. The fused `mha` operator
-  targets NPU2 only.
+- Attention softmax, LayerNorm and GELU in the decode step, and the
+  vocabulary projection, still run on the CPU. The fused `mha` operator
+  targets NPU2 only, so encoder attention is built from per-head GEMMs and
+  softmax.
+- The encoder's NPU LayerNorm, softmax and GELU kernels cost accuracy; see the
+  warning under the validation table.
 - Only one process can use the NPU at a time; a second process fails to
   create its hardware context.
