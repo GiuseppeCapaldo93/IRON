@@ -1391,6 +1391,480 @@ class IncrementalDecoderKernels:
         self.projection_mlp_768_fn = self.projection_mlp_768.get_callable()
 
 
+class DecoderPrefillRuntime:
+    """Persistent five-kernel runtime for four-token Whisper decoder prefill."""
+
+    def __init__(
+        self,
+        build_root,
+        block_weights,
+    ):
+        self.build_root = Path(build_root)
+
+        self.block_weights = block_weights
+
+        self.logical_rows = 4
+
+        self.layernorm = LayerNorm(
+            size=4 * STATE,
+            num_aie_columns=1,
+            num_channels=1,
+            tile_size=STATE,
+            context=make_context(
+                self.build_root,
+                "layernorm-4",
+            ),
+        )
+
+        self.layernorm.compile()
+
+        self.layernorm_fn = self.layernorm.get_callable()
+
+        self.projection = GEMM(
+            M=DECODER_PHYSICAL_SEQ,
+            K=STATE,
+            N=STATE,
+            num_aie_columns=1,
+            tile_m=16,
+            tile_k=64,
+            tile_n=64,
+            prio_accuracy=True,
+            emulate_bf16_mmul_with_bfp16=False,
+            context=make_context(
+                self.build_root,
+                "gemm-768-768",
+            ),
+        )
+
+        self.projection.compile()
+
+        self.projection_fn = self.projection.get_callable()
+
+        self.score = GEMM(
+            M=DECODER_PHYSICAL_SEQ,
+            K=HEAD_DIM,
+            N=DECODER_PHYSICAL_SEQ,
+            num_aie_columns=1,
+            tile_m=16,
+            tile_k=64,
+            tile_n=64,
+            prio_accuracy=True,
+            emulate_bf16_mmul_with_bfp16=False,
+            context=make_context(
+                self.build_root,
+                "score-64-64",
+            ),
+        )
+
+        self.score.compile()
+
+        self.score_fn = self.score.get_callable()
+
+        self.fc1 = GEMM(
+            M=DECODER_PHYSICAL_SEQ,
+            K=STATE,
+            N=MLP,
+            num_aie_columns=1,
+            tile_m=16,
+            tile_k=64,
+            tile_n=64,
+            prio_accuracy=True,
+            emulate_bf16_mmul_with_bfp16=False,
+            context=make_context(
+                self.build_root,
+                "gemm-768-3072",
+            ),
+        )
+
+        self.fc1.compile()
+
+        self.fc1_fn = self.fc1.get_callable()
+
+        self.fc2 = GEMM(
+            M=DECODER_PHYSICAL_SEQ,
+            K=MLP,
+            N=STATE,
+            num_aie_columns=1,
+            tile_m=16,
+            tile_k=64,
+            tile_n=64,
+            prio_accuracy=True,
+            emulate_bf16_mmul_with_bfp16=False,
+            context=make_context(
+                self.build_root,
+                "gemm-3072-768",
+            ),
+        )
+
+        self.fc2.compile()
+
+        self.fc2_fn = self.fc2.get_callable()
+
+    def layer_norm(
+        self,
+        x,
+        weight,
+        bias,
+    ):
+        tensor_class = aie_utils.DEFAULT_TENSOR_CLASS
+
+        x_npu = tensor_class.from_torch(x.to(torch.bfloat16).contiguous())
+
+        output_npu = tensor_class(
+            (
+                4,
+                STATE,
+            ),
+            dtype=np.dtype("bfloat16"),
+        )
+
+        self.layernorm_fn(
+            x_npu,
+            output_npu,
+        )
+
+        bare = (
+            output_npu.to_torch()
+            .float()
+            .clone()
+            .reshape(
+                4,
+                STATE,
+            )
+        )
+
+        return bare * weight.float() + bias.float()
+
+    def self_attention(
+        self,
+        x,
+        weights,
+    ):
+        x_norm = self.layer_norm(
+            x,
+            weights["self_attn_layer_norm.weight"],
+            weights["self_attn_layer_norm.bias"],
+        )
+
+        q = run_projection(
+            self.projection_fn,
+            x_norm,
+            weights["self_attn.q_proj.weight"],
+            weights["self_attn.q_proj.bias"],
+            4,
+        )
+
+        k = run_projection(
+            self.projection_fn,
+            x_norm,
+            weights["self_attn.k_proj.weight"],
+            None,
+            4,
+        )
+
+        v = run_projection(
+            self.projection_fn,
+            x_norm,
+            weights["self_attn.v_proj.weight"],
+            weights["self_attn.v_proj.bias"],
+            4,
+        )
+
+        qh = split_heads(q)
+        kh = split_heads(k)
+        vh = split_heads(v)
+
+        scores = torch.empty(
+            (
+                HEADS,
+                4,
+                4,
+            ),
+            dtype=torch.float32,
+        )
+
+        for head in range(HEADS):
+            q_pad = torch.zeros(
+                (
+                    DECODER_PHYSICAL_SEQ,
+                    HEAD_DIM,
+                ),
+                dtype=torch.float32,
+            )
+
+            k_pad = torch.zeros(
+                (
+                    HEAD_DIM,
+                    DECODER_PHYSICAL_SEQ,
+                ),
+                dtype=torch.float32,
+            )
+
+            q_pad[:4] = qh[head] * SCALE
+
+            k_pad[:, :4] = (
+                kh[head]
+                .transpose(
+                    0,
+                    1,
+                )
+                .contiguous()
+            )
+
+            physical = run_gemm(
+                self.score_fn,
+                q_pad,
+                k_pad,
+                (
+                    DECODER_PHYSICAL_SEQ,
+                    DECODER_PHYSICAL_SEQ,
+                ),
+            )
+
+            scores[head] = physical[
+                :4,
+                :4,
+            ]
+
+        mask = torch.triu(
+            torch.ones(
+                4,
+                4,
+                dtype=torch.bool,
+            ),
+            diagonal=1,
+        )
+
+        scores = scores.masked_fill(
+            mask,
+            torch.finfo(scores.dtype).min,
+        )
+
+        probs = torch.softmax(
+            scores,
+            dim=-1,
+            dtype=torch.float32,
+        )
+
+        context = merge_heads(
+            torch.matmul(
+                probs,
+                vh,
+            )
+        )
+
+        projected = run_projection(
+            self.projection_fn,
+            context,
+            weights["self_attn.out_proj.weight"],
+            weights["self_attn.out_proj.bias"],
+            4,
+        )
+
+        return (
+            x + projected,
+            kh,
+            vh,
+        )
+
+    def cross_attention(
+        self,
+        x,
+        encoder,
+        weights,
+    ):
+        x_norm = self.layer_norm(
+            x,
+            weights["encoder_attn_layer_norm.weight"],
+            weights["encoder_attn_layer_norm.bias"],
+        )
+
+        q = run_projection(
+            self.projection_fn,
+            x_norm,
+            weights["encoder_attn.q_proj.weight"],
+            weights["encoder_attn.q_proj.bias"],
+            4,
+        )
+
+        k = run_gemm(
+            self.projection_fn,
+            encoder,
+            weights["encoder_attn.k_proj.weight"]
+            .transpose(
+                0,
+                1,
+            )
+            .contiguous(),
+            (
+                64,
+                STATE,
+            ),
+        )
+
+        v = run_gemm(
+            self.projection_fn,
+            encoder,
+            weights["encoder_attn.v_proj.weight"]
+            .transpose(
+                0,
+                1,
+            )
+            .contiguous(),
+            (
+                64,
+                STATE,
+            ),
+        )
+
+        v += weights["encoder_attn.v_proj.bias"]
+
+        qh = split_heads(q)
+        kh = split_heads(k)
+        vh = split_heads(v)
+
+        scores = torch.empty(
+            (
+                HEADS,
+                4,
+                64,
+            ),
+            dtype=torch.float32,
+        )
+
+        for head in range(HEADS):
+            q_pad = torch.zeros(
+                (
+                    DECODER_PHYSICAL_SEQ,
+                    HEAD_DIM,
+                ),
+                dtype=torch.float32,
+            )
+
+            q_pad[:4] = qh[head] * SCALE
+
+            physical = run_gemm(
+                self.score_fn,
+                q_pad,
+                kh[head]
+                .transpose(
+                    0,
+                    1,
+                )
+                .contiguous(),
+                (
+                    DECODER_PHYSICAL_SEQ,
+                    64,
+                ),
+            )
+
+            scores[head] = physical[:4]
+
+        probs = torch.softmax(
+            scores,
+            dim=-1,
+            dtype=torch.float32,
+        )
+
+        context = merge_heads(
+            torch.matmul(
+                probs,
+                vh,
+            )
+        )
+
+        projected = run_projection(
+            self.projection_fn,
+            context,
+            weights["encoder_attn.out_proj.weight"],
+            weights["encoder_attn.out_proj.bias"],
+            4,
+        )
+
+        return (
+            x + projected,
+            kh,
+            vh,
+        )
+
+    def mlp(
+        self,
+        x,
+        weights,
+    ):
+        x_norm = self.layer_norm(
+            x,
+            weights["final_layer_norm.weight"],
+            weights["final_layer_norm.bias"],
+        )
+
+        fc1 = run_projection(
+            self.fc1_fn,
+            x_norm,
+            weights["fc1.weight"],
+            weights["fc1.bias"],
+            4,
+        )
+
+        activated = F.gelu(fc1)
+
+        fc2 = run_projection(
+            self.fc2_fn,
+            activated,
+            weights["fc2.weight"],
+            weights["fc2.bias"],
+            4,
+        )
+
+        return x + fc2
+
+    def run(
+        self,
+        x,
+        encoder,
+    ):
+        caches = {}
+
+        for block in range(BLOCKS):
+            weights = self.block_weights[block]
+
+            (
+                x,
+                self_k,
+                self_v,
+            ) = self.self_attention(
+                x,
+                weights,
+            )
+
+            (
+                x,
+                cross_k,
+                cross_v,
+            ) = self.cross_attention(
+                x,
+                encoder,
+                weights,
+            )
+
+            x = self.mlp(
+                x,
+                weights,
+            )
+
+            caches[block] = {
+                "self_k": (self_k.clone()),
+                "self_v": (self_v.clone()),
+                "cross_k": (cross_k.clone()),
+                "cross_v": (cross_v.clone()),
+            }
+
+        return (
+            x,
+            caches,
+        )
+
+
 class IncrementalSelfProjection:
     """Persistent Q/K/V projection for incremental self-attention."""
 
