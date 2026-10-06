@@ -15,7 +15,7 @@ test_dir = Path(__file__).resolve().parent
 # Validated on the 128-frame real-audio path.
 MAX_ENCODER_NRMSE_PERCENT = 5.0
 # Full-window pipeline, with the encoder's LayerNorm, softmax and GELU on NPU
-# kernels; 5.29% was measured on the 5.9 s test clip (see README.md).
+# kernels; 4.14% was measured on the 5.9 s test clip (see README.md).
 MAX_PIPELINE_ENCODER_NRMSE_PERCENT = 6.0
 
 checkpoint_value = os.environ.get("WHISPER_SAFE")
@@ -149,8 +149,7 @@ def test_whisper_small_transcription():
     reason="WHISPER_LONG_TEST_WAV audio longer than 30 s not found",
 )
 def test_whisper_small_long_form():
-    # Validated with 422-122949-0013 (32.6 s). The 97 s clip in README.md
-    # fails this check at a near-tie in the CPU FP32 logits.
+    # Validated with 422-122949-0013 (32.6 s) and the 97 s clip in README.md.
     result = subprocess.run(
         [
             sys.executable,

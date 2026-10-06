@@ -79,15 +79,16 @@ Compiled kernels go to `--build-dir`, `$IRON_WHISPER_BUILD_DIR`, or
 `C:\iw` to stay below path-length limits. The first run compiles all kernels
 (several minutes).
 
-Validation on Phoenix (warm kernel cache, LibriSpeech clips):
+Validation on Phoenix (warm kernel cache, LibriSpeech clips, mlir-aie
+`1.4.4.dev73` as pinned in `requirements.txt`):
 
 | Clip | Audio | Windows | Encoder NRMSE | Tokens | WER | Encoder | Compute | Decode |
 | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |
-| 1919-142785-0007 | 26.6 s | 1 | 4.40% | exact | 0.0% | 1.5 s | 8.6 s | 13.9 tok/s |
-| 3170-137482-0000 | 28.0 s | 1 | 3.56% | exact | 1.5% | 1.3 s | 8.5 s | 13.5 tok/s |
-| 5.9 s test clip | 5.9 s | 1 | 5.29% | exact | 0.0% | 1.3 s | 3.8 s | 15.1 tok/s |
-| 422-122949-0013 | 32.6 s | 2 | | text exact, timestamps exact | 6.0% | 2.7 s | 13.6 s | 13.4 tok/s |
-| 2902-9006-0005, -0007, -0015 joined | 97.0 s | 4 | | **mismatch**, see below | 2.3% | 5.6 s | 35.8 s | 13.7 tok/s |
+| 1919-142785-0007 | 26.6 s | 1 | 2.71% | exact | 0.0% | 1.4 s | 8.9 s | 13.0 tok/s |
+| 3170-137482-0000 | 28.0 s | 1 | 2.74% | exact | 1.5% | 1.3 s | 8.5 s | 13.6 tok/s |
+| 5.9 s test clip | 5.9 s | 1 | 4.14% | exact | 0.0% | 1.4 s | 4.4 s | 11.8 tok/s |
+| 422-122949-0013 | 32.6 s | 2 | | text exact, timestamps exact | 6.0% | 2.7 s | 14.6 s | 12.3 tok/s |
+| 2902-9006-0005, -0007, -0015 joined | 97.0 s | 4 | | text exact, timestamps within 0.02 s | 2.3% | 5.5 s | 36.4 s | 13.4 tok/s |
 
 The CPU FP32 reference has the same word error rate on every clip. Timings
 vary by up to 2x between identical runs on Windows; the table shows typical
@@ -96,22 +97,19 @@ the encoder took about 2.4 s per window, with an encoder NRMSE of
 1.9-2.7%.
 
 > [!WARNING]
-> **Known accuracy cost of the NPU LayerNorm, softmax and GELU kernels.**
-> With these kernels on the NPU, the encoder NRMSE against FP32 rises from
-> 1.9-2.7% to 3.6-5.3%. Replacing all three with exact CPU functions (still
-> BF16 outputs) brings it back to 2.2% on 1919-142785-0007; each kernel
-> contributes. The NPU GELU uses the tanh approximation, while Whisper uses
-> the exact erf form.
+> **Accuracy of the NPU LayerNorm, softmax and GELU kernels.** These kernels
+> are the largest remaining source of encoder error. With the previous
+> mlir-aie (`1.4.4.dev53`) the encoder NRMSE was 3.6-5.3%; replacing all
+> three with exact CPU functions (still BF16 outputs) brought it to 2.2% on
+> 1919-142785-0007, and each kernel contributed. The NPU GELU uses the tanh
+> approximation, while Whisper uses the exact erf form.
 >
-> The 97 s clip no longer matches the CPU reference. In its first window,
-> after "...swim with the stream", the CPU FP32 model prefers "." over ","
-> by only 0.054 logits (35.880 vs 35.827), and the NPU picks ",". This
-> changes "stream. To accept" to "stream, to accept" and moves one
-> timestamp; the word error rate is unchanged. This clip already fails with
-> exact CPU LayerNorm, softmax and GELU, so the tie is decided by BF16
-> rounding as a whole, not by one kernel. The pipeline reports this as a
-> mismatch and exits non-zero. Better NPU accuracy here needs more precise
-> kernels (an erf GELU, a higher-precision softmax and LayerNorm).
+> With `1.4.4.dev53`, the 97 s clip did not match the CPU reference: in its
+> first window, after "...swim with the stream", the CPU FP32 model prefers
+> "." over "," by only 0.054 logits (35.880 vs 35.827), and the NPU picked
+> ",". With `1.4.4.dev73` it matches. Near-ties like this one are decided by
+> BF16 rounding as a whole, so other audio may still produce such
+> mismatches; the pipeline reports them and exits non-zero.
 
 ## Encoder-only validation
 
@@ -224,7 +222,7 @@ measured approximately:
 
 | Stage | NRMSE | RMSE | Cosine similarity |
 | --- | ---: | ---: | ---: |
-| Final encoder output | 4.706% | 0.06755 | 0.998893 |
+| Final encoder output | 2.730% | 0.03920 | 0.999628 |
 
 The pytest hardware validation enforces a maximum final encoder NRMSE of
 `5.0%`. Five consecutive validation iterations reproduced the same final
