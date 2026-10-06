@@ -3,18 +3,71 @@ SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All righ
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Whisper-small Encoder on Phoenix/NPU1
+# Whisper-small on Phoenix/NPU1
 
-This example runs the Whisper-small encoder on AMD Phoenix/NPU1 using IRON
-and mlir-aie.
+This example runs Whisper-small on AMD Phoenix/NPU1 using IRON and mlir-aie.
 
-The validated path performs Whisper log-Mel preprocessing on the CPU and runs
-the convolutional frontend, all 12 transformer encoder blocks, and the final
-encoder LayerNorm on the NPU.
+- `whisper_pipeline.py` transcribes one 30-second window end to end: WAV in,
+  text out, with the frontend, encoder and decoder matrix products on the NPU.
+- `whisper_encoder.py` is the original short-geometry encoder validation
+  (128 Mel frames, 64 encoder tokens).
+
+## End-to-end transcription
+
+`whisper_pipeline.py` uses Whisper's canonical geometry (3000 Mel frames,
+1500 encoder tokens) and greedy decoding without timestamps.
+
+| Stage | NPU | CPU |
+| --- | --- | --- |
+| Preprocessing | | log-Mel features |
+| Frontend | conv1 and conv2 as GEMMs, GELU | im2col |
+| Encoder (12 blocks) | Q/K/V/out, score, value, fc1, fc2 GEMMs | LayerNorm, masked softmax, GELU |
+| Cross-attention K/V | 768x768 GEMM for all decoder blocks | |
+| Prefill (4 prompt tokens) | LayerNorm, projection, score, fc1, fc2 GEMMs | softmax |
+| Decode (1 token per step) | fused Q/K/V, output, fc1, fc2 GEMVs | LayerNorm, attention, GELU |
+| Token selection | | vocabulary projection, suppression, argmax |
+
+The encoder GEMMs use all four Phoenix columns, except the value GEMM: its
+N=64 is not a multiple of 4 x `tile_n`. Decode steps use four-column GEMVs
+with the decoder weights resident in NPU-visible BF16 buffers, which avoids
+padding a single token to a 64-row GEMM. Each phase stays within the NPU1
+context budget and releases its contexts before the next phase starts.
+
+Run it with:
+
+```text
+python iron/applications/whisper_small/whisper_pipeline.py --wav clip.wav
+```
+
+The script also runs a Hugging Face FP32 CPU reference on the same log-Mel
+features and requires an exact token match; it exits non-zero on a mismatch
+or when no end-of-text token is produced. `--reference-text transcript.txt`
+reports the word error rate against a transcript; `--no-reference` skips the
+CPU reference. `transformers` is required for the tokenizer in either case.
+
+Compiled kernels go to `--build-dir`, `$IRON_WHISPER_BUILD_DIR`, or
+`<artifact dir>/pipeline-build`. On Windows, use a short path such as
+`C:\iw` to stay below path-length limits. The first run compiles all kernels
+(about 6 minutes).
+
+Validation on Phoenix (warm kernel cache, LibriSpeech clips):
+
+| Clip | Audio | Encoder NRMSE | Tokens | WER | Compute | Decode |
+| --- | ---: | ---: | --- | ---: | ---: | ---: |
+| 1919-142785-0007 | 26.6 s | 1.85% | exact | 0.0% | 10.8 s | 12.8 tok/s |
+| 3170-137482-0000 | 28.0 s | 2.11% | exact | 1.5% | 10.6 s | 13.2 tok/s |
+| 5.9 s test clip | 5.9 s | 2.70% | exact | 0.0% | 6.0 s | 13.1 tok/s |
+
+The CPU FP32 reference has the same word error rate on every clip.
+
+Audio longer than 30 s is truncated to the first window; long-form
+chunking is not implemented yet.
+
+## Encoder-only validation
 
 > [!NOTE]
-> This is an encoder example, not a complete speech-to-text implementation.
-> The Whisper decoder and autoregressive token generation are not implemented.
+> The rest of this document describes the short-geometry encoder validation in
+> `whisper_encoder.py`.
 
 ## Model path
 
@@ -148,15 +201,11 @@ absolute error and `5.13e-9` RMSE.
 
 ## Current limitations
 
-The following are outside the validated scope of this example:
-
-- canonical 3000-frame / 1500-token encoder execution
-- Whisper decoder
-- causal decoder self-attention
-- encoder-decoder cross-attention
-- KV-cache behavior
-- autoregressive token generation
-- tokenizer/generation integration
-- end-to-end speech transcription
-
-The next implementation boundary is the Whisper decoder.
+- Audio longer than 30 s is truncated; there is no long-form chunking.
+- Greedy decoding only, without timestamps, beam search or temperature
+  fallback.
+- Attention softmax, LayerNorm in the encoder and decode step, and the
+  vocabulary projection still run on the CPU. The fused `mha` operator
+  targets NPU2 only.
+- Only one process can use the NPU at a time; a second process fails to
+  create its hardware context.

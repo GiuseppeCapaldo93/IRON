@@ -83,3 +83,48 @@ def test_whisper_small_encoder():
         f"Encoder NRMSE {nrmse_percent:.6f}% exceeds "
         f"{MAX_ENCODER_NRMSE_PERCENT:.6f}%"
     )
+
+
+@pytest.mark.extensive
+@pytest.mark.supported_devices("npu1")
+@pytest.mark.metrics(
+    pipeline_encoder_nrmse_percent=(
+        r"Encoder NRMSE vs FP32:\s*(?P<value>[\d\.e\+\-]+)%"
+    ),
+    pipeline_decode_tokens_per_second=(r"decode rate\s+(?P<value>[\d\.]+)"),
+)
+@pytest.mark.skipif(
+    checkpoint is None or not checkpoint.is_file(),
+    reason="WHISPER_SAFE Whisper-small checkpoint not found",
+)
+@pytest.mark.skipif(
+    wav is None or not wav.is_file(),
+    reason="WHISPER_TEST_WAV validation audio not found",
+)
+def test_whisper_small_transcription():
+    result = subprocess.run(
+        [sys.executable, str(test_dir / "whisper_pipeline.py"), "--wav", str(wav)],
+        cwd=test_dir,
+        capture_output=True,
+        text=True,
+    )
+
+    print(result.stdout)
+    print(result.stderr)
+
+    assert result.returncode == 0, (
+        "Whisper-small transcription failed "
+        f"with return code {result.returncode}\n"
+        f"stderr:\n{result.stderr}"
+    )
+    assert "Exact CPU FP32 token match: True" in result.stdout
+
+    match = re.search(
+        r"Encoder NRMSE vs FP32:\s*(?P<value>[\d\.e\+\-]+)%", result.stdout
+    )
+    assert match is not None, f"Encoder NRMSE not found.\nstdout:\n{result.stdout}"
+    nrmse_percent = float(match.group("value"))
+    assert nrmse_percent <= MAX_ENCODER_NRMSE_PERCENT, (
+        f"Full-window encoder NRMSE {nrmse_percent:.6f}% exceeds "
+        f"{MAX_ENCODER_NRMSE_PERCENT:.6f}%"
+    )
