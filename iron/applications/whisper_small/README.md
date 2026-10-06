@@ -31,8 +31,12 @@ The encoder GEMMs use all four Phoenix columns, except the value GEMM: its
 N=64 is not a multiple of 4 x `tile_n`. The decoder processes the prompt and
 every generated token one at a time with four-column GEMVs, with the decoder
 weights resident in NPU-visible BF16 buffers, which avoids padding a single
-token to a 64-row GEMM. Each phase stays within the NPU1 context budget and
-releases its contexts before the next phase starts.
+token to a 64-row GEMM. All NPU weights are converted to resident BF16 buffers
+once at startup, and the encoder GEMMs and decoder GEMVs reuse their input and
+output buffers and one XRT run object across calls: allocating buffers or runs
+per call costs more than most of these kernels' NPU work. Each phase stays
+within the NPU1 context budget and releases its contexts before the next phase
+starts.
 
 Run it with:
 
@@ -68,11 +72,11 @@ Validation on Phoenix (warm kernel cache, LibriSpeech clips):
 
 | Clip | Audio | Windows | Encoder NRMSE | Tokens | WER | Compute | Decode |
 | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: |
-| 1919-142785-0007 | 26.6 s | 1 | 1.85% | exact | 0.0% | 11.7 s | 13.4 tok/s |
-| 3170-137482-0000 | 28.0 s | 1 | 2.11% | exact | 1.5% | 11.5 s | 13.1 tok/s |
-| 5.9 s test clip | 5.9 s | 1 | 2.70% | exact | 0.0% | 7.4 s | 13.4 tok/s |
-| 422-122949-0013 | 32.6 s | 2 | | text exact, timestamps exact | 6.0% | 18.1 s | 13.9 tok/s |
-| 2902-9006-0005, -0007, -0015 joined | 97.0 s | 4 | | text exact, timestamps within 0.02 s | 2.3% | 46.9 s | 11.9 tok/s |
+| 1919-142785-0007 | 26.6 s | 1 | 1.85% | exact | 0.0% | 9.3 s | 13.0 tok/s |
+| 3170-137482-0000 | 28.0 s | 1 | 2.11% | exact | 1.5% | 9.3 s | 14.2 tok/s |
+| 5.9 s test clip | 5.9 s | 1 | 2.70% | exact | 0.0% | 5.3 s | 12.6 tok/s |
+| 422-122949-0013 | 32.6 s | 2 | | text exact, timestamps exact | 6.0% | 14.7 s | 13.6 tok/s |
+| 2902-9006-0005, -0007, -0015 joined | 97.0 s | 4 | | text exact, timestamps within 0.02 s | 2.3% | 42.6 s | 11.8 tok/s |
 
 The CPU FP32 reference has the same word error rate on every clip. Timings
 vary by up to 2x between identical runs on Windows; the table shows typical

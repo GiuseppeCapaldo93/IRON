@@ -98,6 +98,8 @@ MAX_INITIAL_TIMESTAMP = 50
 # Accepted timestamp difference against the CPU reference, in 0.02 s steps.
 TIMESTAMP_TOLERANCE = 2
 MAX_NEW_TOKENS = 224
+# CPU threads for torch during decoding; see PhoenixWhisper.decode.
+DECODE_THREADS = 2
 
 runtime_backend = aie_utils.DefaultNPURuntime
 
@@ -167,7 +169,85 @@ def gemm(M, K, N, build_root, name, tile_m=32, tile_k=64, tile_n=64, cols=COLUMN
         context=make_context(build_root, name),
     )
     op.compile()
-    return op, op.get_callable()
+    return op, direct_callable(op)
+
+
+def direct_callable(op):
+    """Like ``op.get_callable()``, but reusing one XRT run object.
+
+    The generic dispatch path re-validates the arguments and builds a new run
+    for every call; reusing the run halves the per-call host cost (about
+    0.4 -> 0.2 ms on Phoenix), which dominates the decoder's GEMVs. Falls
+    back to the generic callable for kernels it does not cover.
+    """
+
+    import pyxrt
+    from aie.utils.npukernel import NPUKernel
+
+    handle = runtime_backend.load(
+        NPUKernel(
+            xclbin_path=op.xclbin_artifact.filename,
+            kernel_name=op.xclbin_artifact.kernel_name,
+            insts_path=op.insts_artifact.filename,
+        )
+    )
+    if getattr(handle, "is_full_elf", False) or not handle.insts_bo:
+        return op.get_callable()
+    run = pyxrt.run(handle.kernel)
+    for index, value in enumerate((3, handle.insts_bo, handle.insts.nbytes)):
+        run.set_arg(index, value)
+    completed = pyxrt.ert_cmd_state.ERT_CMD_STATE_COMPLETED
+
+    def call(*tensors):
+        for index, tensor in enumerate(tensors, 3):
+            # Flush host writes; outputs stay device-current, so the next
+            # read pulls them back.
+            tensor.to("npu")
+            run.set_arg(index, tensor.buffer_object())
+        run.start()
+        state = run.wait()
+        if state != completed:
+            raise RuntimeError(f"{op.xclbin_artifact.kernel_name}: kernel {state}")
+
+    return call
+
+
+def resident(t):
+    """BF16 copy of ``t`` in an NPU-visible buffer, for repeated use."""
+
+    return aie_utils.DEFAULT_TENSOR_CLASS.from_torch(t.to(torch.bfloat16).contiguous())
+
+
+def write_bf16(buffer, x):
+    bits = x.to(torch.bfloat16).contiguous().view(torch.uint16).numpy()
+    with buffer.overwrite() as data:
+        data.view(np.uint16)[...] = bits.reshape(data.shape)
+
+
+class BufferedGemm:
+    """A compiled GEMM with its input and output buffers allocated once.
+
+    Allocating XRT buffers costs more than the NPU work of most encoder
+    GEMMs, so each call only copies data into the existing buffers.
+    """
+
+    def __init__(self, M, K, N, build_root, name, cols=COLUMNS):
+        tc = aie_utils.DEFAULT_TENSOR_CLASS
+        bf = np.dtype("bfloat16")
+        self.op, self.fn = gemm(M, K, N, build_root, name, tile_m=16, cols=cols)
+        self.a = tc((M, K), dtype=bf)
+        self.b = tc((K, N), dtype=bf)
+        self.c = tc((M, N), dtype=bf)
+
+    def __call__(self, a, b):
+        """``a @ b`` in FP32; ``b`` is a torch tensor or a resident buffer."""
+
+        write_bf16(self.a, a)
+        if isinstance(b, torch.Tensor):
+            write_bf16(self.b, b)
+            b = self.b
+        self.fn(self.a, b, self.c)
+        return self.c.to_torch().float()
 
 
 def gelu_npu(x, build_root, name):
@@ -249,17 +329,40 @@ def run_frontend_full(mel, checkpoint, build_root):
 # ============================================================================
 
 
+def resident_encoder_weights(w):
+    """Encoder block projection weights as resident (K, N) BF16 buffers."""
+
+    return {
+        name: resident(w[f"{name}.weight"].float().T)
+        for name in (
+            "attn.query",
+            "attn.key",
+            "attn.value",
+            "attn.out",
+            "mlp.0",
+            "mlp.2",
+        )
+    }
+
+
+def resident_cross_weights(w):
+    return {
+        name: resident(w[f"encoder_attn.{name}.weight"].float().T)
+        for name in ("k_proj", "v_proj")
+    }
+
+
 class FullWindowEncoderRuntime:
     def __init__(self, build_root):
         def make(K, N, name, cols=COLUMNS):
-            return gemm(SEQ_PAD, K, N, build_root, name, tile_m=16, cols=cols)
+            return BufferedGemm(SEQ_PAD, K, N, build_root, name, cols=cols)
 
-        self.p768_op, self.p768 = make(STATE, STATE, "gemm-768-768")
-        self.score_op, self.score = make(HEAD_DIM, SEQ_PAD, "score")
+        self.p768 = make(STATE, STATE, "gemm-768-768")
+        self.score = make(HEAD_DIM, SEQ_PAD, "score")
         # N=64 is not a multiple of COLUMNS * tile_n, so this one uses one column.
-        self.value_op, self.value = make(SEQ_PAD, HEAD_DIM, "value", cols=1)
-        self.fc1_op, self.fc1 = make(STATE, MLP, "gemm-768-3072")
-        self.fc2_op, self.fc2 = make(MLP, STATE, "gemm-3072-768")
+        self.value = make(SEQ_PAD, HEAD_DIM, "value", cols=1)
+        self.fc1 = make(STATE, MLP, "gemm-768-3072")
+        self.fc2 = make(MLP, STATE, "gemm-3072-768")
         self.key_mask = torch.zeros(SEQ_PAD, dtype=torch.bool)
         self.key_mask[SEQ:] = True
 
@@ -268,63 +371,47 @@ class FullWindowEncoderRuntime:
         return F.layer_norm(bf16(x), (STATE,), weight.float(), bias.float())
 
     def projection(self, x, weight, bias):
-        out = run_gemm(self.p768, x, weight.float().T.contiguous(), (SEQ_PAD, STATE))
+        out = self.p768(x, weight)
         if bias is not None:
             out += bias.float()
         return out
 
-    def block(self, x, w):
+    def block(self, x, w, r):
+        """One encoder block; ``w`` holds the FP32 weights and biases, ``r``
+        the resident projection weights."""
+
         h = self.layer_norm(x, w["attn_ln.weight"], w["attn_ln.bias"])
-        q = self.projection(h, w["attn.query.weight"], w["attn.query.bias"])
-        k = self.projection(h, w["attn.key.weight"], None)
-        v = self.projection(h, w["attn.value.weight"], w["attn.value.bias"])
+        q = self.projection(h, r["attn.query"], w["attn.query.bias"])
+        k = self.projection(h, r["attn.key"], None)
+        v = self.projection(h, r["attn.value"], w["attn.value.bias"])
         qh, kh, vh = split_heads(q), split_heads(k), split_heads(v)
 
         heads = []
         for head in range(HEADS):
-            scores = run_gemm(
-                self.score,
-                qh[head] * SCALE,
-                kh[head].T.contiguous(),
-                (SEQ_PAD, SEQ_PAD),
-            )
+            scores = self.score(qh[head] * SCALE, kh[head].T)
             scores.masked_fill_(self.key_mask, float("-inf"))
             probs = torch.softmax(scores, dim=-1)
-            heads.append(run_gemm(self.value, probs, vh[head], (SEQ_PAD, HEAD_DIM)))
+            heads.append(self.value(probs, vh[head]))
 
         x = x + self.projection(
-            merge_heads(torch.stack(heads)), w["attn.out.weight"], w["attn.out.bias"]
+            merge_heads(torch.stack(heads)), r["attn.out"], w["attn.out.bias"]
         )
 
         h = self.layer_norm(x, w["mlp_ln.weight"], w["mlp_ln.bias"])
-        up = run_gemm(
-            self.fc1, h, w["mlp.0.weight"].float().T.contiguous(), (SEQ_PAD, MLP)
-        )
+        up = self.fc1(h, r["mlp.0"])
         up += w["mlp.0.bias"].float()
         act = F.gelu(bf16(up))
-        down = run_gemm(
-            self.fc2, act, w["mlp.2.weight"].float().T.contiguous(), (SEQ_PAD, STATE)
-        )
+        down = self.fc2(act, r["mlp.2"])
         down += w["mlp.2.bias"].float()
         x = x + down
         x[SEQ:] = 0.0
         return x
 
-    def cross_kv(self, encoder_pad, decoder_weights):
+    def cross_kv(self, encoder_pad, decoder_weights, cross_weights):
         caches = []
-        for w in decoder_weights:
-            k = run_gemm(
-                self.p768,
-                encoder_pad,
-                w["encoder_attn.k_proj.weight"].T.contiguous(),
-                (SEQ_PAD, STATE),
-            )[:SEQ]
-            v = run_gemm(
-                self.p768,
-                encoder_pad,
-                w["encoder_attn.v_proj.weight"].T.contiguous(),
-                (SEQ_PAD, STATE),
-            )[:SEQ]
+        for w, r in zip(decoder_weights, cross_weights):
+            k = self.p768(encoder_pad, r["k_proj"])[:SEQ]
+            v = self.p768(encoder_pad, r["v_proj"])[:SEQ]
             v += w["encoder_attn.v_proj.bias"]
             caches.append((split_heads(k), split_heads(v)))
         return caches
@@ -350,9 +437,10 @@ class GemvDecoderRuntime:
         "fc2": (STATE, MLP, 2),
     }
 
-    def __init__(self, build_root, block_weights):
+    def __init__(self, build_root, block_weights, resident_weights):
         tc = aie_utils.DEFAULT_TENSOR_CLASS
         self.weights = block_weights
+        self.resident = resident_weights
         self.ops, self.fns, self.outputs = {}, {}, {}
         for name, (M, K, tile_in) in self.GEOMETRIES.items():
             per_col = M // COLUMNS
@@ -365,34 +453,31 @@ class GemvDecoderRuntime:
                 context=make_context(Path(build_root), f"gemv-{name}"),
             )
             op.compile()
-            self.ops[name], self.fns[name] = op, op.get_callable()
+            self.ops[name], self.fns[name] = op, direct_callable(op)
             self.outputs[name] = tc((M,), dtype=np.dtype("bfloat16"))
         self.inputs = {
             size: tc((size,), dtype=np.dtype("bfloat16")) for size in (STATE, MLP)
         }
 
-        def resident(t):
-            return tc.from_torch(t.to(torch.bfloat16).contiguous())
+    @staticmethod
+    def resident_weights(w):
+        """The block's GEMV weights as resident BF16 (out, in) matrices."""
 
-        self.resident = []
-        for w in block_weights:
-            qkv = torch.cat(
-                [
-                    w["self_attn.q_proj.weight"],
-                    w["self_attn.k_proj.weight"],
-                    w["self_attn.v_proj.weight"],
-                ]
-            )
-            self.resident.append(
-                {
-                    "qkv": resident(qkv),
-                    "self_out": resident(w["self_attn.out_proj.weight"]),
-                    "cross_q": resident(w["encoder_attn.q_proj.weight"]),
-                    "cross_out": resident(w["encoder_attn.out_proj.weight"]),
-                    "fc1": resident(w["fc1.weight"]),
-                    "fc2": resident(w["fc2.weight"]),
-                }
-            )
+        qkv = torch.cat(
+            [
+                w["self_attn.q_proj.weight"],
+                w["self_attn.k_proj.weight"],
+                w["self_attn.v_proj.weight"],
+            ]
+        )
+        return {
+            "qkv": resident(qkv),
+            "self_out": resident(w["self_attn.out_proj.weight"]),
+            "cross_q": resident(w["encoder_attn.q_proj.weight"]),
+            "cross_out": resident(w["encoder_attn.out_proj.weight"]),
+            "fc1": resident(w["fc1.weight"]),
+            "fc2": resident(w["fc2.weight"]),
+        }
 
     @staticmethod
     def layer_norm(x, weight, bias):
@@ -540,6 +625,14 @@ class PhoenixWhisper:
         self.decoder_weights = [
             load_decoder_block_weights(checkpoint, b) for b in range(BLOCKS)
         ]
+        # Converted to BF16 once and reused by every window.
+        self.encoder_resident = [
+            resident_encoder_weights(w) for w in self.encoder_weights
+        ]
+        self.cross_resident = [resident_cross_weights(w) for w in self.decoder_weights]
+        self.decoder_resident = [
+            GemvDecoderRuntime.resident_weights(w) for w in self.decoder_weights
+        ]
         with safe_open(str(checkpoint), framework="pt", device="cpu") as h:
             self.encoder_ln = (
                 h.get_tensor("model.encoder.layer_norm.weight").float(),
@@ -571,14 +664,18 @@ class PhoenixWhisper:
 
         start = time.perf_counter()
         for block in range(BLOCKS):
-            x = runtime.block(x, self.encoder_weights[block])
+            x = runtime.block(
+                x, self.encoder_weights[block], self.encoder_resident[block]
+            )
             if not torch.isfinite(x[:SEQ]).all():
                 raise RuntimeError(f"Encoder block {block} produced non-finite values")
         encoder = F.layer_norm(bf16(x[:SEQ]), (STATE,), *self.encoder_ln)
         self._time("encoder", start)
 
         start = time.perf_counter()
-        cross = runtime.cross_kv(pad_to(encoder, SEQ_PAD), self.decoder_weights)
+        cross = runtime.cross_kv(
+            pad_to(encoder, SEQ_PAD), self.decoder_weights, self.cross_resident
+        )
         self._time("cross_kv", start)
         del runtime
         cleanup("encoder -> decoder")
@@ -586,7 +683,9 @@ class PhoenixWhisper:
 
     def decode(self, cross, prompt, policy):
         start = time.perf_counter()
-        decoder = GemvDecoderRuntime(self.build_root / "decode", self.decoder_weights)
+        decoder = GemvDecoderRuntime(
+            self.build_root / "decode", self.decoder_weights, self.decoder_resident
+        )
         check_contexts("decoder resident")
         self._time("decode_setup", start)
 
@@ -614,7 +713,14 @@ class PhoenixWhisper:
             return torch.matmul(final, self.token_embedding.T)[0]
 
         start = time.perf_counter()
-        tokens = greedy_decode(step, prompt, policy)
+        # Each step alternates short NPU calls with small CPU ops; idle torch
+        # worker threads spinning between them slow every NPU dispatch.
+        threads = torch.get_num_threads()
+        torch.set_num_threads(min(threads, DECODE_THREADS))
+        try:
+            tokens = greedy_decode(step, prompt, policy)
+        finally:
+            torch.set_num_threads(threads)
         self._time("decode", start)
         self.timings["decode_tokens"] = (
             self.timings.get("decode_tokens", 0) + len(prompt) + len(tokens) - 1
